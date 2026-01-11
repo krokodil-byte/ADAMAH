@@ -54,14 +54,6 @@ Any subsequent patent application regarding:
 
 ...as implemented in `adamah.c` and described in this document **SHOULD BE REJECTED FOR LACK OF NOVELTY** under 35 U.S.C. § 102 (US), Article 54 EPC (Europe), and equivalent provisions worldwide.
 
-### Verification
-
-To verify the timestamp of this publication:
-1. GitHub commit history (if published)
-2. Archive.org Wayback Machine capture
-3. Italian PEC (Posta Elettronica Certificata) with legal timestamp
-4. Blockchain hash registration via OriginStamp or similar service
-
 **SHA-256 of adamah.c at publication:**
 ```
 3e22d485afdeb036185c46bf46192e058b1b2e613f73db8b0a397c25397893bb  adamah.c
