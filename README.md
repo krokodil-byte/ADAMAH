@@ -4,7 +4,7 @@
 
 A minimal Vulkan compute library (~1100 lines C) implementing scatter/gather operations and vector math as fundamental primitives for machine learning inference and training.
 
-**Author:** Sam (Samuele), Italy  
+**Author:** Samuele Scuglia, Italy  
 **Date:** January 11, 2026  
 **License:** AGPL-3.0
 
