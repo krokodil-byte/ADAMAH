@@ -1,4 +1,4 @@
-# ADAMAH (1.1.1)- GPU Memory & Math Library
+# ADAMAH(1.2.0) - GPU Memory & Math Library
 
 **As simple as possible, but complete.**
 
@@ -183,7 +183,7 @@ gcc -O3 your_code.c adamah.c -o app -lvulkan -lm
 
 ## License
 
-CC BY-NC 4.0 - Samuele Scuglia, January 2026
+CC BY-NC 4.0 - Sam 2026
 
 ---
 
