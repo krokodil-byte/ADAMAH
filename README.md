@@ -1,4 +1,4 @@
-# ADAMAH v3 - GPU Memory & Math Library
+# ADAMAH - GPU Memory & Math Library
 
 **As simple as possible, but complete.**
 
@@ -183,8 +183,8 @@ gcc -O3 your_code.c adamah.c -o app -lvulkan -lm
 
 ## License
 
-CC BY-NC 4.0 - Sam 2026
+CC BY-NC 4.0 - Samuele Scuglia 2026
 
 ---
 
-**ADAMAH** = Ground/Earth (Hebrew אדמה) - The foundation for computation.
+**ADAMAH** = Ground/Earth - The foundation for computation.
