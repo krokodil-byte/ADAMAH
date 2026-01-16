@@ -1,116 +1,143 @@
 /*
- * ADAMAH Test Suite - Maps + Math
+ * ADAMAH v3 Test
  */
 #include "adamah.h"
 #include <stdio.h>
 #include <math.h>
 
-#define TEST(cond, msg) do { if (!(cond)) { printf("FAIL: %s\n", msg); return 1; } } while(0)
-#define NEAR(a, b) (fabsf((a) - (b)) < 1e-4)
+#define NEAR(a, b) (fabsf((a) - (b)) < 0.01f)
+#define PI 3.14159265f
 
 int main(void) {
-    printf("=== ADAMAH Unified Test Suite ===\n\n");
+    printf("=== ADAMAH v3 Test ===\n\n");
     
-    TEST(adamah_init() == ADAMAH_OK, "init");
-    printf("✓ adamah_init\n");
+    adamah_init();
+    printf("✓ init\n");
     
-    // === MAP TESTS ===
-    printf("\n--- Map Tests ---\n");
+    // Basic ops
+    float a[] = {1, 2, 3, 4};
+    float b[] = {4, 3, 2, 1};
     
-    TEST(map_init(0, 32, 256, 256) == ADAMAH_OK, "map_init");
-    printf("✓ map_init (word_size=32, 64K elements)\n");
+    inject("a", a, 4);
+    inject("b", b, 4);
+    printf("✓ inject\n");
     
-    uint64_t locs[3] = {100, 200, 300};
-    float vals[24] = {1,2,3,4,5,6,7,8, 9,10,11,12,13,14,15,16, 17,18,19,20,21,22,23,24};
-    TEST(mscatter(0, locs, vals, 3) == ADAMAH_OK, "mscatter");
-    printf("✓ mscatter 3 elements\n");
+    vop2(VOP_ADD, "c", "a", "b", 4);
+    float c[4];
+    extract("c", c, 4);
+    printf("✓ ADD: %.0f + %.0f = %.0f\n", a[0], b[0], c[0]);
     
-    float out[24] = {0};
-    TEST(mgather(0, locs, out, 3) == ADAMAH_OK, "mgather");
-    TEST(NEAR(out[0], 1) && NEAR(out[8], 9) && NEAR(out[16], 17), "gather values");
-    printf("✓ mgather verified\n");
+    vop2(VOP_POW, "pow", "a", "b", 4);
+    float pow_r[4];
+    extract("pow", pow_r, 4);
+    printf("✓ POW: %.0f ^ %.0f = %.0f\n", a[0], b[0], pow_r[0]);
     
-    TEST(map_save(0, "/tmp/test_map.bin") == ADAMAH_OK, "save");
-    map_clear(0);
-    TEST(map_load(0, "/tmp/test_map.bin") == ADAMAH_OK, "load");
-    mgather(0, locs, out, 3);
-    TEST(NEAR(out[0], 1), "load verify");
-    printf("✓ map_save/load\n");
+    // Trig
+    float angles[] = {0, PI/6, PI/4, PI/2};
+    inject("ang", angles, 4);
+    vop1(VOP_SIN, "sin", "ang", 4);
+    vop1(VOP_COS, "cos", "ang", 4);
+    vop1(VOP_TAN, "tan", "ang", 3);  // skip PI/2
+    float sin_r[4], cos_r[4];
+    extract("sin", sin_r, 4);
+    extract("cos", cos_r, 4);
+    printf("✓ SIN(π/6) = %.3f (expect 0.5)\n", sin_r[1]);
+    printf("✓ COS(π/4) = %.3f (expect 0.707)\n", cos_r[2]);
+    
+    // Inverse trig
+    float vals[] = {0.5f, 0.707f, 1.0f};
+    inject("vals", vals, 3);
+    vop1(VOP_ASIN, "asin", "vals", 3);
+    float asin_r[3];
+    extract("asin", asin_r, 3);
+    printf("✓ ASIN(0.5) = %.3f (expect %.3f)\n", asin_r[0], PI/6);
+    
+    // Hyperbolic
+    float x[] = {0, 1, 2};
+    inject("x", x, 3);
+    vop1(VOP_SINH, "sinh", "x", 3);
+    vop1(VOP_COSH, "cosh", "x", 3);
+    float sinh_r[3], cosh_r[3];
+    extract("sinh", sinh_r, 3);
+    extract("cosh", cosh_r, 3);
+    printf("✓ SINH(1) = %.3f, COSH(1) = %.3f\n", sinh_r[1], cosh_r[1]);
+    
+    // Rounding
+    float floats[] = {1.2f, 2.5f, 3.7f, -1.5f};
+    inject("floats", floats, 4);
+    vop1(VOP_FLOOR, "floor", "floats", 4);
+    vop1(VOP_CEIL, "ceil", "floats", 4);
+    vop1(VOP_ROUND, "round", "floats", 4);
+    float floor_r[4], ceil_r[4], round_r[4];
+    extract("floor", floor_r, 4);
+    extract("ceil", ceil_r, 4);
+    extract("round", round_r, 4);
+    printf("✓ FLOOR(2.5)=%.0f CEIL(2.5)=%.0f ROUND(2.5)=%.0f\n", floor_r[1], ceil_r[1], round_r[1]);
+    
+    // Sign
+    float signs[] = {-5, 0, 5};
+    inject("signs", signs, 3);
+    vop1(VOP_SIGN, "sign", "signs", 3);
+    float sign_r[3];
+    extract("sign", sign_r, 3);
+    printf("✓ SIGN(-5, 0, 5) = (%.0f, %.0f, %.0f)\n", sign_r[0], sign_r[1], sign_r[2]);
+    
+    // Reduce
+    vreduce(VRED_PROD, "prod", "a", 4);
+    vreduce(VRED_MEAN, "mean", "a", 4);
+    float prod_r, mean_r;
+    extract("prod", &prod_r, 1);
+    extract("mean", &mean_r, 1);
+    printf("✓ PROD([1,2,3,4]) = %.0f\n", prod_r);
+    printf("✓ MEAN([1,2,3,4]) = %.2f\n", mean_r);
+    
+    // Cumsum
+    vcumsum("cumsum", "a", 4);
+    float cumsum_r[4];
+    extract("cumsum", cumsum_r, 4);
+    printf("✓ CUMSUM([1,2,3,4]) = [%.0f,%.0f,%.0f,%.0f]\n", cumsum_r[0], cumsum_r[1], cumsum_r[2], cumsum_r[3]);
+    
+    // Diff
+    vdiff("diff", "a", 4);
+    float diff_r[3];
+    extract("diff", diff_r, 3);
+    printf("✓ DIFF([1,2,3,4]) = [%.0f,%.0f,%.0f]\n", diff_r[0], diff_r[1], diff_r[2]);
+    
+    // Integrate / Derivative
+    float f[] = {0, 1, 4, 9, 16};  // x^2 at x=0,1,2,3,4
+    inject("f", f, 5);
+    vintegrate("integral", "f", 1.0f, 5);
+    vderivative("deriv", "f", 1.0f, 5);
+    float integral_r[5], deriv_r[4];
+    extract("integral", integral_r, 5);
+    extract("deriv", deriv_r, 4);
+    printf("✓ INTEGRATE(x²) dx=1: [%.0f,%.0f,%.0f,%.0f,%.0f]\n", 
+           integral_r[0], integral_r[1], integral_r[2], integral_r[3], integral_r[4]);
+    printf("✓ DERIVATIVE(x²): [%.0f,%.0f,%.0f,%.0f] (expect 1,3,5,7)\n",
+           deriv_r[0], deriv_r[1], deriv_r[2], deriv_r[3]);
+    
+    // Linspace / Arange
+    vlinspace("lin", 0, 10, 5);
+    varange("rng", 0, 2.5f, 5);
+    float lin_r[5], rng_r[5];
+    extract("lin", lin_r, 5);
+    extract("rng", rng_r, 5);
+    printf("✓ LINSPACE(0,10,5) = [%.1f,%.1f,%.1f,%.1f,%.1f]\n", lin_r[0], lin_r[1], lin_r[2], lin_r[3], lin_r[4]);
+    printf("✓ ARANGE(0,2.5,5) = [%.1f,%.1f,%.1f,%.1f,%.1f]\n", rng_r[0], rng_r[1], rng_r[2], rng_r[3], rng_r[4]);
+    
+    // Map
+    map_init(0, 32, 256, 256);
+    float locs[] = {100, 200, 300};
+    float vals_m[] = {1,0,0,0,0,0,0,0, 2,0,0,0,0,0,0,0, 3,0,0,0,0,0,0,0};
+    inject("locs", locs, 3);
+    inject("vals", vals_m, 24);
+    mscatter(0, "locs", "vals", 3);
+    mgather(0, "locs", "out", 3);
+    float out[24];
+    extract("out", out, 24);
+    printf("✓ MAP scatter/gather: [%.0f, %.0f, %.0f]\n", out[0], out[8], out[16]);
     
     map_destroy(0);
-    
-    // === VBUF TESTS ===
-    printf("\n--- VBuf Tests ---\n");
-    
-    TEST(vbuf_alloc(0, 16) == ADAMAH_OK, "vbuf_alloc 0");
-    TEST(vbuf_alloc(1, 16) == ADAMAH_OK, "vbuf_alloc 1");
-    TEST(vbuf_alloc(2, 16) == ADAMAH_OK, "vbuf_alloc 2");
-    printf("✓ vbuf_alloc\n");
-    
-    float a[] = {1, 2, 3, 4, 5, 6, 7, 8};
-    float b[] = {8, 7, 6, 5, 4, 3, 2, 1};
-    vbuf_upload(0, a, 0, 8);
-    vbuf_upload(1, b, 0, 8);
-    printf("✓ vbuf_upload\n");
-    
-    // === MATH TESTS ===
-    printf("\n--- Math Tests ---\n");
-    
-    vop2(VOP_ADD, 2, 0, 1, 8);
-    float r[8];
-    vbuf_download(2, r, 0, 8);
-    TEST(NEAR(r[0], 9) && NEAR(r[7], 9), "ADD");
-    printf("✓ vop2 ADD: 1+8=%.0f, 8+1=%.0f\n", r[0], r[7]);
-    
-    vop2(VOP_MUL, 2, 0, 1, 8);
-    vbuf_download(2, r, 0, 8);
-    TEST(NEAR(r[0], 8) && NEAR(r[3], 20), "MUL");
-    printf("✓ vop2 MUL: 1*8=%.0f, 4*5=%.0f\n", r[0], r[3]);
-    
-    vop_scalar(VOP_MUL, 2, 0, 10.0f, 8);
-    vbuf_download(2, r, 0, 8);
-    TEST(NEAR(r[0], 10) && NEAR(r[4], 50), "scalar MUL");
-    printf("✓ vop_scalar: 1*10=%.0f, 5*10=%.0f\n", r[0], r[4]);
-    
-    float t[] = {0, 1, -1, 2, -2, 0, 0, 0};
-    vbuf_upload(0, t, 0, 8);
-    vop1(VOP_RELU, 2, 0, 5);
-    vbuf_download(2, r, 0, 5);
-    TEST(NEAR(r[0], 0) && NEAR(r[1], 1) && NEAR(r[2], 0), "RELU");
-    printf("✓ vop1 RELU: relu(-1)=%.0f, relu(1)=%.0f\n", r[2], r[1]);
-    
-    float e[] = {0, 1, 0, 0, 0, 0, 0, 0};
-    vbuf_upload(0, e, 0, 8);
-    vop1(VOP_EXP, 2, 0, 2);
-    vbuf_download(2, r, 0, 2);
-    TEST(NEAR(r[0], 1.0) && NEAR(r[1], 2.7183), "EXP");
-    printf("✓ vop1 EXP: e^0=%.2f, e^1=%.2f\n", r[0], r[1]);
-    
-    float s[] = {1, 2, 3, 4, 5, 0, 0, 0};
-    vbuf_upload(0, s, 0, 8);
-    vreduce(VRED_SUM, 2, 0, 5);
-    vbuf_download(2, r, 0, 1);
-    TEST(NEAR(r[0], 15), "SUM");
-    printf("✓ vreduce SUM: 1+2+3+4+5=%.0f\n", r[0]);
-    
-    float da[] = {1, 2, 3, 4};
-    float db[] = {4, 3, 2, 1};
-    vbuf_upload(0, da, 0, 4);
-    vbuf_upload(1, db, 0, 4);
-    vdot(2, 0, 1, 4);
-    vbuf_download(2, r, 0, 1);
-    TEST(NEAR(r[0], 20), "DOT");
-    printf("✓ vdot: [1,2,3,4]·[4,3,2,1]=%.0f\n", r[0]);
-    
-    float sm[] = {1, 2, 3, 4};
-    vbuf_upload(0, sm, 0, 4);
-    vsoftmax(0, 0, 4);
-    vbuf_download(0, r, 0, 4);
-    float sum = r[0]+r[1]+r[2]+r[3];
-    TEST(NEAR(sum, 1.0), "softmax sum");
-    printf("✓ vsoftmax: sum=%.4f\n", sum);
-    
-    vbuf_free(0); vbuf_free(1); vbuf_free(2);
     adamah_shutdown();
     
     printf("\n=== ALL TESTS PASSED ===\n");

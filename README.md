@@ -1,128 +1,21 @@
-# ADAMAH
+# ADAMAH v3 - GPU Memory & Math Library
 
-**GPU Memory Maps + Vector Math for ML Primitives**
+**As simple as possible, but complete.**
 
-A minimal Vulkan compute library (~1100 lines C) implementing scatter/gather operations and vector math as fundamental primitives for machine learning inference and training.
-
-**Author:** Samuele Scuglia, Italy  
-**Date:** January 11, 2026  
-**License:** AGPL-3.0
-
----
-
-## Defensive Disclosure & Prior Art Declaration
-
-### IMPORTANT LEGAL NOTICE
-
-This document and associated source code constitute a **Defensive Publication** and **Prior Art Disclosure** under international patent law conventions.
-
-**Publication Date:** January 11, 2026  
-**Author:** Samuele Scuglia, Lecco, Italy  
-**Witnesses:** Claude by Anthropic AI (conversation logs preserved) / Github (directly or via archive.org)
-
-### Claims of Prior Art
-
-This implementation establishes prior art for the following technical innovations:
-
-1. **Vulkan Compute Scatter/Gather for ML Memory Maps**
-   - Coordination of `VkBuffer` with `VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT | VK_MEMORY_PROPERTY_HOST_COHERENT_BIT` for zero-copy CPU↔GPU coherent memory access in ML workloads
-   - Use of `VkSpecializationConstant` (constant_id=0) to parameterize `WORDS_PER_ELEM` for variable element sizes (4, 8, 16, 32 bytes) without shader recompilation overhead
-   - Descriptor set binding pattern: `binding=0` locations, `binding=1` source data, `binding=2` destination data for scatter; reversed src/dst for gather
-
-2. **Sparse Memory Representation for Neural Networks**
-   - Implicit zero-default semantics: non-existent entries return zero without explicit storage
-   - Pack-based addressing: `total_elems = pack_size * n_packs` where `pack_size` must be power-of-two for efficient GPU dispatch
-   - Direct binary persistence via `fwrite/fread` on HOST_VISIBLE mapped memory
-
-3. **Unified Scatter/Gather + Vector Math API**
-   - Single Vulkan context managing both memory maps (`mscatter/mgather`) and compute operations (`vop1/vop2/vreduce`)
-   - VBuf abstraction: GPU-resident working memory with `vbuf_alloc/upload/download` interface
-   - Push constant encoding: `{count, op}` pair for operation dispatch
-
-4. **SPIR-V Shader Architecture**
-   - Binary ops shader: Switch-based operation selection (ADD=0, SUB=1, MUL=2, DIV=3)
-   - Unary ops shader: Extended ops (NEG=10, ABS=11, SQRT=12, EXP=13, LOG=14, TANH=15, RELU=16, GELU=17, SIN=18, COS=19, RECIP=20, SQR=21, COPY=22)
-   - Reduce shader: Shared memory parallel reduction with identity element initialization per operation type
-
-### Patent Rejection Clause
-
-Any subsequent patent application regarding:
-- GPU-based scatter/gather operations for embedding tables using Vulkan descriptors
-- Vulkan compute shaders for ML primitive operations (element-wise, reduction)
-- Memory-mapped neural network weight storage with HOST_VISIBLE coherent access
-- Variable element size handling via SPIR-V specialization constants
-
-...as implemented in `adamah.c` and described in this document **SHOULD BE REJECTED FOR LACK OF NOVELTY** under 35 U.S.C. § 102 (US), Article 54 EPC (Europe), and equivalent provisions worldwide.
-
-**SHA-256 of adamah.c at publication:**
-```
-3e22d485afdeb036185c46bf46192e058b1b2e613f73db8b0a397c25397893bb  adamah.c
-0f024fdd235756e636b1e8b21f636d27c5312af499bb3a9043b3c4f1a2bad842  adamah.h
-f5b76243b3809e40ea3feeb55040c80a5db68ff1a5f035e2acc551fffdc64379  test.c
+```c
+inject("x", data, n);
+vop1(VOP_SIN, "y", "x", n);
+extract("y", result, n);
 ```
 
----
+## Features
 
-## Technical Architecture
-
-### Vulkan Resource Layout
-
-```
-VkInstance
-└── VkDevice (first GPU with compute queue)
-    ├── VkShaderModule (5 embedded SPIR-V shaders)
-    │   ├── scatter.spv - map[locs[i]] = vals[i]
-    │   ├── gather.spv  - out[i] = map[locs[i]]
-    │   ├── binary.spv  - dst[i] = a[i] OP b[i]
-    │   ├── unary.spv   - dst[i] = OP(a[i])
-    │   └── reduce.spv  - dst[0] = reduce(a[0:n])
-    │
-    ├── VkDescriptorSetLayout
-    │   └── 3x VK_DESCRIPTOR_TYPE_STORAGE_BUFFER
-    │
-    ├── VkPipelineLayout
-    │   └── Push constants: uint32_t[2] = {count, op}
-    │
-    ├── Maps[16] - Memory maps for weights/embeddings
-    │   ├── data_buffer (HOST_VISIBLE, total_elems * word_size)
-    │   ├── gpu_locs (HOST_VISIBLE, pack_size * 8 bytes)
-    │   └── gpu_vals (HOST_VISIBLE, pack_size * word_size)
-    │
-    └── VBufs[64] - Working memory for compute
-        └── float buffer (HOST_VISIBLE)
-```
-
-### Shader Implementation Details
-
-**Scatter Shader Logic:**
-```glsl
-layout(constant_id = 0) const uint WORDS_PER_ELEM = 1;
-// Uses OpTypePointer StorageBuffer with coherent access
-// Loop: for w in [0, WORDS_PER_ELEM): map[dst+w] = vals[src+w]
-```
-
-**Gather Shader Logic:**
-```glsl
-// Reversed binding order from scatter for cache efficiency
-// binding=1 is source (map), binding=2 is destination (output)
-```
-
-**Reduce Shader Logic:**
-```glsl
-shared float sdata[256];  // Workgroup shared memory
-// Parallel tree reduction with barrier synchronization
-// Identity elements: SUM→0, MAX→-inf, MIN→+inf
-```
-
----
+- **Named Buffers** - Auto-managed, no manual alloc/free
+- **Memory Maps** - Scatter/gather for sparse data
+- **Full Math** - Trig, calculus, reduce ops
+- **Single Header** - Just `adamah.h` + `adamah.c`
 
 ## Quick Start
-
-```bash
-make test
-```
-
-## Usage
 
 ```c
 #include "adamah.h"
@@ -130,97 +23,168 @@ make test
 int main() {
     adamah_init();
     
-    // Memory map for embeddings (64K elements, 32 bytes each)
-    map_init(0, 32, 256, 256);
-    mscatter(0, locs, vals, n);  // GPU write
-    mgather(0, locs, out, n);    // GPU read
+    float x[] = {0, 0.5, 1.0, 1.5};
+    inject("x", x, 4);
     
-    // Vector math
-    vbuf_alloc(0, 1024);
-    vbuf_alloc(1, 1024);
-    vop2(VOP_ADD, 0, 0, 1, 1024);  // GPU: v0 = v0 + v1
-    vop1(VOP_TANH, 0, 0, 1024);    // GPU: v0 = tanh(v0)
-    vsoftmax(0, 0, 1024);          // softmax in-place
+    vop1(VOP_SIN, "y", "x", 4);
+    
+    float y[4];
+    extract("y", y, 4);
+    // y = [0, 0.479, 0.841, 0.997]
     
     adamah_shutdown();
 }
 ```
 
+## API Reference
+
+### Core
+```c
+int adamah_init(void);
+void adamah_shutdown(void);
+```
+
+### Buffers
+```c
+int inject(const char* name, const float* data, uint32_t count);
+int extract(const char* name, float* data, uint32_t count);
+uint32_t bufsize(const char* name);
+```
+
+### Binary Ops - `dst = a OP b`
+```c
+int vop2(uint32_t op, const char* dst, const char* a, const char* b, uint32_t count);
+
+VOP_ADD   // +
+VOP_SUB   // -
+VOP_MUL   // *
+VOP_DIV   // /
+VOP_POW   // a^b
+VOP_ATAN2 // atan2(a,b)
+VOP_MOD   // fmod
+VOP_MIN   // min(a,b)
+VOP_MAX   // max(a,b)
+```
+
+### Unary Ops - `dst = OP(a)`
+```c
+int vop1(uint32_t op, const char* dst, const char* a, uint32_t count);
+
+// Basic
+VOP_NEG, VOP_ABS, VOP_SQRT, VOP_SQR, VOP_RECIP, VOP_COPY
+
+// Exponential
+VOP_EXP, VOP_EXP2, VOP_LOG, VOP_LOG2, VOP_LOG10
+
+// Trigonometric
+VOP_SIN, VOP_COS, VOP_TAN, VOP_ASIN, VOP_ACOS, VOP_ATAN
+
+// Hyperbolic
+VOP_SINH, VOP_COSH, VOP_TANH
+
+// Rounding
+VOP_FLOOR, VOP_CEIL, VOP_ROUND, VOP_TRUNC, VOP_SIGN
+
+// ML Activations
+VOP_RELU, VOP_GELU
+```
+
+### Scalar Ops - `dst = a OP scalar`
+```c
+int vops(uint32_t op, const char* dst, const char* a, float scalar, uint32_t count);
+```
+
+### Reduce Ops - `dst[0] = reduce(a)`
+```c
+int vreduce(uint32_t op, const char* dst, const char* a, uint32_t count);
+
+VRED_SUM   // Σ
+VRED_PROD  // Π
+VRED_MAX   // max
+VRED_MIN   // min
+VRED_MEAN  // μ
+```
+
+### Linear Algebra
+```c
+int vdot(const char* dst, const char* a, const char* b, uint32_t count);
+int vmatvec(const char* dst, const char* mat, const char* vec, uint32_t rows, uint32_t cols);
+int vsoftmax(const char* buf, uint32_t count);
+```
+
+### Calculus
+```c
+int vcumsum(const char* dst, const char* a, uint32_t count);      // Cumulative sum
+int vcumprod(const char* dst, const char* a, uint32_t count);     // Cumulative product
+int vdiff(const char* dst, const char* a, uint32_t count);        // Finite differences
+int vintegrate(const char* dst, const char* a, float dx, uint32_t count);   // ∫a dx
+int vderivative(const char* dst, const char* a, float dx, uint32_t count);  // da/dx
+```
+
+### Generators
+```c
+int vlinspace(const char* dst, float start, float stop, uint32_t count);
+int varange(const char* dst, float start, float step, uint32_t count);
+```
+
+### Memory Maps (Sparse)
+```c
+int map_init(uint32_t id, uint32_t word_size, uint32_t pack_size, uint32_t n_packs);
+int map_destroy(uint32_t id);
+int map_clear(uint32_t id);
+int mscatter(uint32_t id, const char* locs, const char* vals, uint32_t count);
+int mgather(uint32_t id, const char* locs, const char* dst, uint32_t count);
+int map_save(uint32_t id, const char* path);
+int map_load(uint32_t id, const char* path);
+```
+
+## Examples
+
+### Signal Processing
+```c
+vlinspace("t", 0, 6.28, 1000);     // t = [0, 2π]
+vop1(VOP_SIN, "wave", "t", 1000);  // sin wave
+vderivative("dw", "wave", 0.00628, 1000);  // derivative
+```
+
+### Statistics
+```c
+inject("data", samples, n);
+vreduce(VRED_MEAN, "mean", "data", n);
+vreduce(VRED_MAX, "max", "data", n);
+```
+
+### Neural Network Layer
+```c
+inject("x", input, 784);
+inject("W", weights, 784*128);
+vmatvec("h", "W", "x", 128, 784);
+vop1(VOP_RELU, "h", "h", 128);
+vsoftmax("h", 128);
+```
+
+### Sparse Embeddings
+```c
+map_init(0, 128, 1024, 1024);  // 1M x 128 embedding table
+inject("ids", token_ids, batch);
+mgather(0, "ids", "emb", batch);
+```
+
 ## Build
 
 ```bash
-gcc myapp.c adamah.c -o myapp -lvulkan -lm
+gcc -O3 your_code.c adamah.c -o app -lvulkan -lm
 ```
 
-## API Reference
+## Requirements
 
-### Maps (Persistent Memory)
-| Function | Description |
-|----------|-------------|
-| `map_init(id, word_size, pack_size, n_packs)` | Create map |
-| `mscatter(id, locs, vals, count)` | Write values to locations |
-| `mgather(id, locs, out, count)` | Read values from locations |
-| `map_save/load(id, path)` | Binary persistence |
-| `map_clear(id)` | Zero entire map |
-| `map_limit(id)` | Max valid index |
-
-### VBufs (Working Memory)
-| Function | Description |
-|----------|-------------|
-| `vbuf_alloc(id, n_floats)` | Allocate GPU buffer |
-| `vbuf_free(id)` | Release buffer |
-| `vbuf_upload/download(id, data, offset, count)` | Transfer data |
-| `vbuf_zero(id, offset, count)` | Zero region |
-
-### Math Operations
-| Function | Description |
-|----------|-------------|
-| `vop2(op, dst, a, b, count)` | Binary: dst = a OP b |
-| `vop1(op, dst, a, count)` | Unary: dst = OP(a) |
-| `vop_scalar(op, dst, a, scalar, count)` | Scalar: dst = a OP scalar |
-| `vreduce(op, dst, a, count)` | Reduce: dst[0] = reduce(a) |
-| `vdot(dst, a, b, count)` | Dot product |
-| `vfma(dst, a, b, c, count)` | Fused multiply-add |
-| `vsoftmax(buf, offset, count)` | Softmax in-place |
-| `vmatvec(dst, mat, vec, rows, cols)` | Matrix-vector multiply |
-
-### Operation Codes
-```c
-// Binary
-VOP_ADD=0, VOP_SUB=1, VOP_MUL=2, VOP_DIV=3
-
-// Unary  
-VOP_NEG=10, VOP_ABS=11, VOP_SQRT=12, VOP_EXP=13, VOP_LOG=14,
-VOP_TANH=15, VOP_RELU=16, VOP_GELU=17, VOP_SIN=18, VOP_COS=19,
-VOP_RECIP=20, VOP_SQR=21, VOP_COPY=22
-
-// Reduce
-VRED_SUM=0, VRED_MAX=1, VRED_MIN=2
-```
-
----
-
-## Philosophy
-
-**Everything is memory access.**
-
-Traditional ML frameworks treat matrix multiplication as the fundamental operation. ADAMAH inverts this: scatter/gather (memory access patterns) are the primitives, and matmul is just one pattern among many.
-
-This enables:
-- Sparse models without dense allocation overhead
-- Natural KV-cache implementation via scatter/gather
-- Unified interface for embeddings, weights, and activations
-- Direct GPU persistence without serialization
-
----
+- Vulkan 1.0+
+- C99 compiler
 
 ## License
 
-AGPL-3.0 - See LICENSE file.
-
-Any use in network services (APIs, cloud inference, etc.) requires full source code disclosure of all modifications.
+CC BY-NC 4.0 - Sam 2026
 
 ---
 
-**© 2026 Samuele Scuglia (Krokodil-byte) - All rights reserved under AGPL-3.0**  
-
+**ADAMAH** = Ground/Earth (Hebrew אדמה) - The foundation for computation.
