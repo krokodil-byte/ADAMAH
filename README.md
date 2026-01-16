@@ -1,4 +1,4 @@
-# ADAMAH - GPU Memory & Math Library
+# ADAMAH (1.1.1)- GPU Memory & Math Library
 
 **As simple as possible, but complete.**
 
