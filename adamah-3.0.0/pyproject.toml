@@ -1,0 +1,21 @@
+[build-system]
+requires = ["setuptools>=61.0", "wheel"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "adamah"
+version = "3.0.0"
+description = "GPU Memory & Math Library"
+readme = "README.md"
+authors = [{name = "Samuele Scuglia"}]
+requires-python = ">=3.8"
+dependencies = ["numpy"]
+
+[project.urls]
+Homepage = "https://github.com/sam/adamah"
+
+[tool.setuptools.packages.find]
+where = ["src"]
+
+[tool.setuptools.package-data]
+adamah = ["*.c", "*.h", "*.so"]
