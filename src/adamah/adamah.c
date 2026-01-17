@@ -1,6 +1,6 @@
 /*
  * ADAMAH v3 - Named Buffers + Auto Management
- * 
+ *
  * AGPL-3.0 - Sam 2026
  */
 
@@ -10,6 +10,10 @@
 #include <string.h>
 #include <stdio.h>
 #include <math.h>
+
+#ifdef _OPENMP
+#include <omp.h>
+#endif
 
 #define MAX_BUFFERS 256
 #define MAX_MAPS 16
@@ -310,31 +314,47 @@ int vop2(uint32_t op, const char* dst, const char* a, const char* b, uint32_t co
     if (!na || !nb_src) return ADAMAH_ERR_NOT_FOUND;
     NamedBuffer* nd = get_or_create_buffer(dst, count);
     if (!nd) return ADAMAH_ERR_MEMORY;
-    
+
     float *pa = na->ptr, *pb = nb_src->ptr, *pd = nd->ptr;
-    switch (op) {
-        case VOP_ADD:   for (uint32_t i = 0; i < count; i++) pd[i] = pa[i] + pb[i]; break;
-        case VOP_SUB:   for (uint32_t i = 0; i < count; i++) pd[i] = pa[i] - pb[i]; break;
-        case VOP_MUL:   for (uint32_t i = 0; i < count; i++) pd[i] = pa[i] * pb[i]; break;
-        case VOP_DIV:   for (uint32_t i = 0; i < count; i++) pd[i] = pa[i] / pb[i]; break;
-        case VOP_POW:   for (uint32_t i = 0; i < count; i++) pd[i] = powf(pa[i], pb[i]); break;
-        case VOP_ATAN2: for (uint32_t i = 0; i < count; i++) pd[i] = atan2f(pa[i], pb[i]); break;
-        case VOP_MOD:   for (uint32_t i = 0; i < count; i++) pd[i] = fmodf(pa[i], pb[i]); break;
-        case VOP_MIN:   for (uint32_t i = 0; i < count; i++) pd[i] = pa[i] < pb[i] ? pa[i] : pb[i]; break;
-        case VOP_MAX:   for (uint32_t i = 0; i < count; i++) pd[i] = pa[i] > pb[i] ? pa[i] : pb[i]; break;
-        default: return ADAMAH_ERR_INVALID;
+
+    // Use OpenMP for large arrays (>= 1000 elements)
+    #ifdef _OPENMP
+    #pragma omp parallel for if(count >= 1000)
+    #endif
+    for (uint32_t i = 0; i < count; i++) {
+        switch (op) {
+            case VOP_ADD:   pd[i] = pa[i] + pb[i]; break;
+            case VOP_SUB:   pd[i] = pa[i] - pb[i]; break;
+            case VOP_MUL:   pd[i] = pa[i] * pb[i]; break;
+            case VOP_DIV:   pd[i] = pa[i] / pb[i]; break;
+            case VOP_POW:   pd[i] = powf(pa[i], pb[i]); break;
+            case VOP_ATAN2: pd[i] = atan2f(pa[i], pb[i]); break;
+            case VOP_MOD:   pd[i] = fmodf(pa[i], pb[i]); break;
+            case VOP_MIN:   pd[i] = pa[i] < pb[i] ? pa[i] : pb[i]; break;
+            case VOP_MAX:   pd[i] = pa[i] > pb[i] ? pa[i] : pb[i]; break;
+            default: break;
+        }
     }
     return ADAMAH_OK;
 }
 
 int vop1(uint32_t op, const char* dst, const char* a, uint32_t count) {
     if (!ctx.initialized) return ADAMAH_ERR_INVALID;
+
+    // Validate operation
+    if (op < VOP_NEG || (op > VOP_SIGN && op < VOP_POW)) return ADAMAH_ERR_INVALID;
+
     NamedBuffer* na = find_buffer(a);
     if (!na) return ADAMAH_ERR_NOT_FOUND;
     NamedBuffer* nd = get_or_create_buffer(dst, count);
     if (!nd) return ADAMAH_ERR_MEMORY;
-    
+
     float *pa = na->ptr, *pd = nd->ptr;
+
+    // Use OpenMP for large arrays (>= 1000 elements)
+    #ifdef _OPENMP
+    #pragma omp parallel for if(count >= 1000)
+    #endif
     for (uint32_t i = 0; i < count; i++) {
         float x = pa[i];
         switch (op) {
@@ -365,7 +385,7 @@ int vop1(uint32_t op, const char* dst, const char* a, uint32_t count) {
             case VOP_ROUND: pd[i] = roundf(x); break;
             case VOP_TRUNC: pd[i] = truncf(x); break;
             case VOP_SIGN:  pd[i] = (x > 0) - (x < 0); break;
-            default: return ADAMAH_ERR_INVALID;
+            default: pd[i] = x; break; // Fallback: copy
         }
     }
     return ADAMAH_OK;
@@ -377,17 +397,65 @@ int vops(uint32_t op, const char* dst, const char* a, float scalar, uint32_t cou
     if (!na) return ADAMAH_ERR_NOT_FOUND;
     NamedBuffer* nd = get_or_create_buffer(dst, count);
     if (!nd) return ADAMAH_ERR_MEMORY;
-    
+
     float *pa = na->ptr, *pd = nd->ptr;
-    switch (op) {
-        case VOP_ADD: for (uint32_t i = 0; i < count; i++) pd[i] = pa[i] + scalar; break;
-        case VOP_SUB: for (uint32_t i = 0; i < count; i++) pd[i] = pa[i] - scalar; break;
-        case VOP_MUL: for (uint32_t i = 0; i < count; i++) pd[i] = pa[i] * scalar; break;
-        case VOP_DIV: for (uint32_t i = 0; i < count; i++) pd[i] = pa[i] / scalar; break;
-        default: return ADAMAH_ERR_INVALID;
+
+    // Use OpenMP for large arrays (>= 1000 elements)
+    #ifdef _OPENMP
+    #pragma omp parallel for if(count >= 1000)
+    #endif
+    for (uint32_t i = 0; i < count; i++) {
+        switch (op) {
+            case VOP_ADD: pd[i] = pa[i] + scalar; break;
+            case VOP_SUB: pd[i] = pa[i] - scalar; break;
+            case VOP_MUL: pd[i] = pa[i] * scalar; break;
+            case VOP_DIV: pd[i] = pa[i] / scalar; break;
+            default: break;
+        }
     }
     return ADAMAH_OK;
 }
+
+// ============================================
+// Extended functions with mode parameter
+// ============================================
+
+int vop1_ex(uint32_t op, const char* dst, const char* a, uint32_t count, int mode) {
+    mode = resolve_mode(mode, count);
+
+    // For now, only CPU is implemented
+    if (mode == ADAMAH_MODE_GPU) {
+        fprintf(stderr, "GPU mode not yet implemented, falling back to CPU\n");
+    }
+
+    return vop1(op, dst, a, count);
+}
+
+int vop2_ex(uint32_t op, const char* dst, const char* a, const char* b, uint32_t count, int mode) {
+    mode = resolve_mode(mode, count);
+
+    // For now, only CPU is implemented
+    if (mode == ADAMAH_MODE_GPU) {
+        fprintf(stderr, "GPU mode not yet implemented, falling back to CPU\n");
+    }
+
+    return vop2(op, dst, a, b, count);
+}
+
+int vops_ex(uint32_t op, const char* dst, const char* a, float scalar, uint32_t count, int mode) {
+    mode = resolve_mode(mode, count);
+
+    // For now, only CPU is implemented
+    if (mode == ADAMAH_MODE_GPU) {
+        fprintf(stderr, "GPU mode not yet implemented, falling back to CPU\n");
+    }
+
+    return vops(op, dst, a, scalar, count);
+}
+
+// ============================================
+// Reduce ops
+// ============================================
 
 int vreduce(uint32_t op, const char* dst, const char* a, uint32_t count) {
     if (!ctx.initialized) return ADAMAH_ERR_INVALID;

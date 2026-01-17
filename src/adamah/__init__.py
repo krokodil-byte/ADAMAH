@@ -23,6 +23,24 @@ FLOOR, CEIL, ROUND, TRUNC, SIGN = 32, 33, 34, 35, 36
 RECIP, SQR, COPY = 20, 21, 22
 SUM, RMAX, RMIN, PROD, MEAN = 0, 1, 2, 3, 4
 
+# Execution modes
+MODE_CPU = 0
+MODE_GPU = 1
+MODE_AUTO = 2
+_MODE_USE_GLOBAL = -1
+
+def _mode_to_int(mode):
+    """Convert mode string to int"""
+    if mode is None:
+        return _MODE_USE_GLOBAL
+    if isinstance(mode, str):
+        mode = mode.lower()
+        if mode == 'cpu': return MODE_CPU
+        if mode == 'gpu': return MODE_GPU
+        if mode == 'auto': return MODE_AUTO
+        raise ValueError(f"Invalid mode: {mode}. Use 'cpu', 'gpu', or 'auto'")
+    return mode
+
 _lib = None
 _pkg_dir = os.path.dirname(os.path.abspath(__file__))
 
@@ -43,7 +61,7 @@ def _get_lib():
         print("ADAMAH: Compiling native library...")
         try:
             subprocess.check_call([
-                'gcc', '-shared', '-fPIC', '-O3',
+                'gcc', '-shared', '-fPIC', '-O3', '-fopenmp',
                 c_path, '-o', so_path,
                 '-lvulkan', '-lm'
             ], stderr=subprocess.DEVNULL)
@@ -55,13 +73,23 @@ def _get_lib():
     # Setup function signatures
     _lib.adamah_init.restype = ctypes.c_int
     _lib.adamah_shutdown.restype = None
+    _lib.adamah_set_mode.argtypes = [ctypes.c_int]
+    _lib.adamah_set_mode.restype = None
+    _lib.adamah_get_mode.restype = ctypes.c_int
     _lib.inject.argtypes = [ctypes.c_char_p, ctypes.POINTER(ctypes.c_float), ctypes.c_uint32]
     _lib.inject.restype = ctypes.c_int
     _lib.extract.argtypes = [ctypes.c_char_p, ctypes.POINTER(ctypes.c_float), ctypes.c_uint32]
     _lib.extract.restype = ctypes.c_int
     _lib.bufsize.argtypes = [ctypes.c_char_p]
     _lib.bufsize.restype = ctypes.c_uint32
-    
+    # _ex functions with mode parameter
+    _lib.vop1_ex.argtypes = [ctypes.c_uint32, ctypes.c_char_p, ctypes.c_char_p, ctypes.c_uint32, ctypes.c_int]
+    _lib.vop1_ex.restype = ctypes.c_int
+    _lib.vop2_ex.argtypes = [ctypes.c_uint32, ctypes.c_char_p, ctypes.c_char_p, ctypes.c_char_p, ctypes.c_uint32, ctypes.c_int]
+    _lib.vop2_ex.restype = ctypes.c_int
+    _lib.vops_ex.argtypes = [ctypes.c_uint32, ctypes.c_char_p, ctypes.c_char_p, ctypes.c_float, ctypes.c_uint32, ctypes.c_int]
+    _lib.vops_ex.restype = ctypes.c_int
+
     return _lib
 
 class Adamah:
@@ -80,7 +108,16 @@ class Adamah:
     def shutdown(self):
         if self._lib:
             self._lib.adamah_shutdown()
-    
+
+    def set_mode(self, mode):
+        """Set execution mode: 'cpu', 'gpu', or 'auto'"""
+        self._lib.adamah_set_mode(_mode_to_int(mode))
+
+    def get_mode(self):
+        """Get current execution mode"""
+        mode = self._lib.adamah_get_mode()
+        return ['cpu', 'gpu', 'auto'][mode]
+
     def put(self, name: str, data) -> int:
         """Inject data: CPU → GPU"""
         arr = np.ascontiguousarray(data, dtype=np.float32)
@@ -96,17 +133,23 @@ class Adamah:
         self._lib.extract(name.encode(), ptr, count)
         return out
     
-    def op1(self, op: int, dst: str, a: str, n: int):
+    def op1(self, op: int, dst: str, a: str, n: int, mode=None):
         """Unary op: dst = op(a)"""
-        return self._lib.vop1(op, dst.encode(), a.encode(), n)
-    
-    def op2(self, op: int, dst: str, a: str, b: str, n: int):
+        if mode is None:
+            return self._lib.vop1(op, dst.encode(), a.encode(), n)
+        return self._lib.vop1_ex(op, dst.encode(), a.encode(), n, _mode_to_int(mode))
+
+    def op2(self, op: int, dst: str, a: str, b: str, n: int, mode=None):
         """Binary op: dst = a op b"""
-        return self._lib.vop2(op, dst.encode(), a.encode(), b.encode(), n)
-    
-    def ops(self, op: int, dst: str, a: str, scalar: float, n: int):
+        if mode is None:
+            return self._lib.vop2(op, dst.encode(), a.encode(), b.encode(), n)
+        return self._lib.vop2_ex(op, dst.encode(), a.encode(), b.encode(), n, _mode_to_int(mode))
+
+    def ops(self, op: int, dst: str, a: str, scalar: float, n: int, mode=None):
         """Scalar op: dst = a op scalar"""
-        return self._lib.vops(op, dst.encode(), a.encode(), ctypes.c_float(scalar), n)
+        if mode is None:
+            return self._lib.vops(op, dst.encode(), a.encode(), ctypes.c_float(scalar), n)
+        return self._lib.vops_ex(op, dst.encode(), a.encode(), ctypes.c_float(scalar), n, _mode_to_int(mode))
     
     def reduce(self, op: int, dst: str, a: str, n: int):
         """Reduce: dst[0] = reduce(a)"""
@@ -143,17 +186,17 @@ class Adamah:
         return self._lib.varange(dst.encode(), ctypes.c_float(start), ctypes.c_float(step), n)
     
     # Convenience shortcuts
-    def sin(self, dst, a, n): return self.op1(SIN, dst, a, n)
-    def cos(self, dst, a, n): return self.op1(COS, dst, a, n)
-    def exp(self, dst, a, n): return self.op1(EXP, dst, a, n)
-    def log(self, dst, a, n): return self.op1(LOG, dst, a, n)
-    def tanh(self, dst, a, n): return self.op1(TANH, dst, a, n)
-    def relu(self, dst, a, n): return self.op1(RELU, dst, a, n)
-    def sqrt(self, dst, a, n): return self.op1(SQRT, dst, a, n)
-    def add(self, dst, a, b, n): return self.op2(ADD, dst, a, b, n)
-    def sub(self, dst, a, b, n): return self.op2(SUB, dst, a, b, n)
-    def mul(self, dst, a, b, n): return self.op2(MUL, dst, a, b, n)
-    def div(self, dst, a, b, n): return self.op2(DIV, dst, a, b, n)
+    def sin(self, dst, a, n, mode=None): return self.op1(SIN, dst, a, n, mode)
+    def cos(self, dst, a, n, mode=None): return self.op1(COS, dst, a, n, mode)
+    def exp(self, dst, a, n, mode=None): return self.op1(EXP, dst, a, n, mode)
+    def log(self, dst, a, n, mode=None): return self.op1(LOG, dst, a, n, mode)
+    def tanh(self, dst, a, n, mode=None): return self.op1(TANH, dst, a, n, mode)
+    def relu(self, dst, a, n, mode=None): return self.op1(RELU, dst, a, n, mode)
+    def sqrt(self, dst, a, n, mode=None): return self.op1(SQRT, dst, a, n, mode)
+    def add(self, dst, a, b, n, mode=None): return self.op2(ADD, dst, a, b, n, mode)
+    def sub(self, dst, a, b, n, mode=None): return self.op2(SUB, dst, a, b, n, mode)
+    def mul(self, dst, a, b, n, mode=None): return self.op2(MUL, dst, a, b, n, mode)
+    def div(self, dst, a, b, n, mode=None): return self.op2(DIV, dst, a, b, n, mode)
     
     # Maps
     def map_init(self, id: int, word_size: int, pack_size: int, n_packs: int):
@@ -184,6 +227,14 @@ def shutdown():
     if _ctx:
         _ctx.shutdown()
         _ctx = None
+
+def set_mode(mode):
+    """Set execution mode: 'cpu', 'gpu', or 'auto'"""
+    return _ctx.set_mode(mode)
+
+def get_mode():
+    """Get current execution mode"""
+    return _ctx.get_mode()
 
 def put(name, data):
     """Inject array"""
