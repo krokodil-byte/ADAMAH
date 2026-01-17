@@ -1,0 +1,18 @@
+# Build artifacts
+*.egg-info/
+dist/
+build/
+*.pyc
+__pycache__/
+
+# Compiled library
+*.so
+*.o
+
+# IDE
+.vscode/
+.idea/
+
+# Python
+*.py[cod]
+.pytest_cache/
