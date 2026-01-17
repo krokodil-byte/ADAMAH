@@ -53,4 +53,4 @@ adamah.shutdown()
 ## License
 
 CC BY-NC 4.0, Scuglia Samuele january 2026
-see adamah(3.0.0)/src/adamah/LICENSE
+See [LICENSE](LICENSE)
