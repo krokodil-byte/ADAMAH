@@ -50,7 +50,14 @@ adamah.shutdown()
 - **Generators**: linspace, arange
 - **Sparse**: scatter/gather memory maps
 
+## Author
+
+**Samuele Scuglia**
+January 2026
+
 ## License
 
-CC BY-NC 4.0, Scuglia Samuele january 2026
-See [LICENSE](LICENSE)
+Creative Commons Attribution-NonCommercial 4.0 International (CC BY-NC 4.0)
+Copyright (c) 2026 Samuele Scuglia
+
+See [LICENSE](LICENSE) for full license text.
