@@ -47,6 +47,7 @@ typedef struct {
 // ============================================
 static struct {
     int initialized;
+    int mode;  // Execution mode (CPU/GPU/AUTO)
     VkInstance instance;
     VkPhysicalDevice phys;
     VkDevice device;
@@ -237,6 +238,39 @@ void adamah_shutdown(void) {
     if (ctx.instance) vkDestroyInstance(ctx.instance, NULL);
     
     memset(&ctx, 0, sizeof(ctx));
+}
+
+// ============================================
+// Mode Selection
+// ============================================
+
+void adamah_set_mode(int mode) {
+    if (mode < ADAMAH_MODE_CPU || mode > ADAMAH_MODE_AUTO) return;
+    ctx.mode = mode;
+}
+
+int adamah_get_mode(void) {
+    return ctx.mode;
+}
+
+// Resolve actual mode (handle AUTO)
+static int resolve_mode(int mode_override, uint32_t count) {
+    int mode = (mode_override == ADAMAH_MODE_USE_GLOBAL) ? ctx.mode : mode_override;
+
+    if (mode == ADAMAH_MODE_AUTO) {
+        // Auto-select: GPU for large arrays (> 10k elements)
+        // For now, use CPU since GPU not implemented yet
+        return ADAMAH_MODE_CPU;
+        // TODO: return (count > 10000) ? ADAMAH_MODE_GPU : ADAMAH_MODE_CPU;
+    }
+
+    // For now, force CPU since GPU not implemented
+    if (mode == ADAMAH_MODE_GPU) {
+        fprintf(stderr, "Warning: GPU mode not yet implemented, using CPU\n");
+        return ADAMAH_MODE_CPU;
+    }
+
+    return mode;
 }
 
 // ============================================

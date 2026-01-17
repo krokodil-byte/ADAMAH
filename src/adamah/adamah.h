@@ -17,6 +17,12 @@
 #define ADAMAH_ERR_INVALID -3
 #define ADAMAH_ERR_NOT_FOUND -4
 
+// Execution modes
+#define ADAMAH_MODE_CPU  0
+#define ADAMAH_MODE_GPU  1
+#define ADAMAH_MODE_AUTO 2
+#define ADAMAH_MODE_USE_GLOBAL -1  // Use global mode (for _ex functions)
+
 // Binary ops
 #define VOP_ADD  0
 #define VOP_SUB  1
@@ -72,6 +78,10 @@
 int adamah_init(void);
 void adamah_shutdown(void);
 
+// Mode selection (CPU/GPU/AUTO)
+void adamah_set_mode(int mode);
+int adamah_get_mode(void);
+
 // ============================================
 // Named Buffers (auto-managed)
 // ============================================
@@ -100,6 +110,11 @@ int vops(uint32_t op, const char* dst, const char* a, float scalar, uint32_t cou
 
 // dst[0] = reduce(a)
 int vreduce(uint32_t op, const char* dst, const char* a, uint32_t count);
+
+// Extended versions with mode override
+int vop1_ex(uint32_t op, const char* dst, const char* a, uint32_t count, int mode);
+int vop2_ex(uint32_t op, const char* dst, const char* a, const char* b, uint32_t count, int mode);
+int vops_ex(uint32_t op, const char* dst, const char* a, float scalar, uint32_t count, int mode);
 
 // dst[0] = dot(a, b)
 int vdot(const char* dst, const char* a, const char* b, uint32_t count);

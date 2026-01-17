@@ -1,0 +1,48 @@
+#version 450
+
+// Workgroup size: 256 threads
+layout (local_size_x = 256) in;
+
+// Push constants for operation selection
+layout(push_constant) uniform PushConstants {
+    uint op_code;
+    uint count;
+} pc;
+
+// Storage buffers
+layout(std430, binding = 0) buffer InputBufferA {
+    float a[];
+};
+
+layout(std430, binding = 1) buffer InputBufferB {
+    float b[];
+};
+
+layout(std430, binding = 2) buffer OutputBuffer {
+    float dst[];
+};
+
+void main() {
+    uint i = gl_GlobalInvocationID.x;
+    if (i >= pc.count) return;
+
+    float val_a = a[i];
+    float val_b = b[i];
+    float result;
+
+    // Operation codes (match adamah.h VOP2_* enum)
+    switch (pc.op_code) {
+        case 0:  result = val_a + val_b; break;             // ADD
+        case 1:  result = val_a - val_b; break;             // SUB
+        case 2:  result = val_a * val_b; break;             // MUL
+        case 3:  result = val_a / val_b; break;             // DIV
+        case 4:  result = pow(val_a, val_b); break;         // POW
+        case 5:  result = atan(val_a, val_b); break;        // ATAN2
+        case 6:  result = mod(val_a, val_b); break;         // MOD
+        case 7:  result = min(val_a, val_b); break;         // MIN
+        case 8:  result = max(val_a, val_b); break;         // MAX
+        default: result = val_a; break;                     // Unknown op
+    }
+
+    dst[i] = result;
+}
