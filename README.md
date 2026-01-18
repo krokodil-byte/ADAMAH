@@ -1,63 +1,131 @@
-# ADAMAH
+# ADAMAH v4.0.0
 
-**GPU Memory & Math Library - As simple as possible, but complete.**
+**Map-Centric GPU Compute Library**
 
-```python
-import adamah
+Pure GPU operations on Memory Maps with scatter/gather for CPU I/O.
 
-adamah.init()
-adamah.put("x", [0, 1, 2, 3])
-adamah.sin("y", "x", 4)
-print(adamah.get("y"))  # [0, 0.841, 0.909, 0.141]
-adamah.shutdown()
+## Architecture
+
+```
+┌─────────────────────────────────────────────────────────────┐
+│                    MAP (GPU VRAM)                           │
+│  ┌─────┬─────┬─────┬─────┬─────┬─────┐                    │
+│  │ [0] │ [1] │ [2] │ ... │[n-1]│     │  ← packs           │
+│  └──┬──┴──┬──┴──┬──┴─────┴─────┴─────┘                    │
+│     │     │     │                                          │
+│  scatter  │  map_op (GPU compute)                         │
+│     ↑     │     │                                          │
+│   CPU    GPU    ↓                                          │
+│   data   only  gather → CPU data                          │
+└─────────────────────────────────────────────────────────────┘
 ```
 
-## Install
+## Installation
 
 ```bash
 pip install adamah
 ```
 
-Requires: `libvulkan-dev` (auto-compiles on first use)
+**Requirements:** Vulkan SDK & drivers
 
-## Usage
+## Quick Start
 
 ```python
 import adamah
 
-# Context manager (recommended)
-with adamah.Adamah() as gpu:
-    gpu.put("a", [1, 2, 3, 4])
-    gpu.put("b", [4, 3, 2, 1])
-    gpu.add("c", "a", "b", 4)
-    print(gpu.get("c"))  # [5, 5, 5, 5]
+gpu = adamah.Adamah()
 
-# Or functional API
-adamah.init()
-adamah.put("x", data)
-adamah.sin("y", "x", len(data))
-result = adamah.get("y")
-adamah.shutdown()
+# Create map: 1M packs of 128 floats
+gpu.map_init(0, word_size=4, pack_size=128, n_packs=1_000_000)
+
+# CPU → GPU
+locs = np.array([0, 1, 2], dtype=np.uint32)
+data = np.random.randn(3 * 128).astype(np.float32)
+gpu.scatter(0, locs, data)
+
+# Pure GPU operations
+gpu.map_sin(0, src_locs, dst_locs)           # sin
+gpu.map_add(0, a_locs, b_locs, out_locs)     # add
+
+# GPU → CPU
+result = gpu.gather(0, out_locs)
+
+# Persistence
+gpu.map_save(0, "model.bin")
+gpu.map_load(0, "model.bin")
+
+gpu.shutdown()
 ```
 
-## Operations
+## API Reference
 
-- **Math**: sin, cos, tan, exp, log, sqrt, tanh, relu, gelu
-- **Ops**: add, sub, mul, div, pow
-- **Reduce**: sum, max, min, mean, prod
-- **Calculus**: cumsum, diff, integrate, derivative
-- **Linear Algebra**: dot, matvec, softmax
-- **Generators**: linspace, arange
-- **Sparse**: scatter/gather memory maps
+### Core
+| Function | Description |
+|----------|-------------|
+| `Adamah()` | Initialize GPU context |
+| `shutdown()` | Cleanup resources |
 
-## Author
+### Memory Maps
+| Function | Description |
+|----------|-------------|
+| `map_init(id, word_size, pack_size, n_packs)` | Create map |
+| `map_destroy(id)` | Destroy map |
+| `map_size(id)` | Get number of packs |
+| `map_save(id, path)` | Save to file |
+| `map_load(id, path)` | Load from file |
 
-**Samuele Scuglia**
-January 2026
+### Data Transfer (CPU ↔ GPU)
+| Function | Description |
+|----------|-------------|
+| `scatter(id, locs, data)` | Write data to map[locs] |
+| `gather(id, locs)` | Read data from map[locs] |
+
+### GPU Operations
+| Function | Description |
+|----------|-------------|
+| `map_op1(id, op, src, dst)` | Unary: map[dst] = op(map[src]) |
+| `map_op2(id, op, a, b, dst)` | Binary: map[dst] = map[a] op map[b] |
+
+**Shortcuts:**
+- `map_sin`, `map_cos`, `map_exp`, `map_tanh`, `map_relu`
+- `map_add`, `map_mul`
+
+### Operations
+
+**Unary (OP_*):** NEG, ABS, SQRT, EXP, LOG, TANH, RELU, GELU, SIN, COS, RECIP, SQR
+
+**Binary (OP_*):** ADD, SUB, MUL, DIV, POW, MIN, MAX
+
+## Example: Neural Network Embedding
+
+```python
+gpu = adamah.Adamah()
+
+# Embedding table: 50k vectors of 768 dims
+gpu.map_init(0, word_size=4, pack_size=768, n_packs=50_000)
+
+# Load pretrained embeddings
+gpu.scatter(0, all_indices, embeddings)
+
+# Lookup batch of 32 tokens
+batch_locs = np.array([tok1, tok2, ..., tok32], dtype=np.uint32)
+vectors = gpu.gather(0, batch_locs)  # Shape: (32 * 768,)
+
+# GPU-side operations on embeddings
+gpu.map_sin(0, batch_locs, output_locs)  # Apply activation
+```
+
+## Performance
+
+- **Zero-copy GPU ops**: Operations stay in VRAM
+- **Sparse access**: scatter/gather by pack index
+- **Async execution**: Vulkan compute shaders
+- **65+ GB/s** memory bandwidth on RTX 3070
 
 ## License
 
-Creative Commons Attribution-NonCommercial 4.0 International (CC BY-NC 4.0)
+**CC BY-NC 4.0** - Creative Commons Attribution-NonCommercial 4.0
+
 Copyright (c) 2026 Samuele Scuglia
 
-See [LICENSE](LICENSE) for full license text.
+Free for non-commercial use with attribution.
