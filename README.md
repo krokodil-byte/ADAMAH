@@ -1,131 +1,108 @@
-# ADAMAH v4.0.0 (soon available on PyPi)
+# ADAMAH v4.1.0
 
-**Map-Centric GPU Compute Library**
+**Map-Centric GPU Compute Library for AI/ML**
 
-Pure GPU operations on Memory Maps with scatter/gather for CPU I/O.
+Zero-CUDA alternative using Vulkan. Supports transformers, embeddings, and neural network operations.
 
-## Architecture
-
-```
-┌─────────────────────────────────────────────────────────────┐
-│                    MAP (GPU VRAM)                           │
-│  ┌─────┬─────┬─────┬─────┬─────┬─────┐                    │
-│  │ [0] │ [1] │ [2] │ ... │[n-1]│     │  ← packs           │
-│  └──┬──┴──┬──┴──┬──┴─────┴─────┴─────┘                    │
-│     │     │     │                                          │
-│  scatter  │  map_op (GPU compute)                         │
-│     ↑     │     │                                          │
-│   CPU    GPU    ↓                                          │
-│   data   only  gather → CPU data                          │
-└─────────────────────────────────────────────────────────────┘
-```
-
-## Installation (Legacy, soon available)
+## Quick Install
 
 ```bash
-pip install adamah
+# One-liner install from GitHub
+pip install git+https://github.com/krokodil-byte/ADAMAH.git
+
+# Requirements: Vulkan drivers + GCC
+sudo apt install libvulkan-dev build-essential  # Ubuntu/Debian
 ```
 
-**Requirements:** Vulkan SDK & drivers
+## Features
+
+- **Matrix Multiplication**: `map_matmul()` - batched matmul on GPU
+- **Reduce Operations**: `map_reduce_sum/max/min()` - for softmax, layernorm
+- **Broadcast**: `map_scale()` - scalar-vector operations
+- **Element-wise**: `map_sin/cos/exp/tanh/relu/gelu/add/mul...`
+- **Scatter/Gather**: Sparse access patterns for embeddings
 
 ## Quick Start
 
 ```python
 import adamah
+import numpy as np
 
 gpu = adamah.Adamah()
 
-# Create map: 1M packs of 128 floats
-gpu.map_init(0, word_size=4, pack_size=128, n_packs=1_000_000)
+# Create GPU memory map
+gpu.map_init(0, word_size=4, pack_size=768, n_packs=50000)  # 50k embeddings
 
-# CPU → GPU
+# Load data (CPU → GPU)
+embeddings = np.random.randn(50000, 768).astype(np.float32)
+gpu.scatter(0, np.arange(50000, dtype=np.uint32), embeddings.flatten())
+
+# GPU operations
 locs = np.array([0, 1, 2], dtype=np.uint32)
-data = np.random.randn(3 * 128).astype(np.float32)
-gpu.scatter(0, locs, data)
+gpu.map_op1(0, adamah.OP_GELU, locs, locs)  # GELU activation
 
-# Pure GPU operations
-gpu.map_sin(0, src_locs, dst_locs)           # sin
-gpu.map_add(0, a_locs, b_locs, out_locs)     # add
-
-# GPU → CPU
-result = gpu.gather(0, out_locs)
-
-# Persistence
-gpu.map_save(0, "model.bin")
-gpu.map_load(0, "model.bin")
+# Read back (GPU → CPU)
+result = gpu.gather(0, locs)
 
 gpu.shutdown()
 ```
 
-## API Reference
-
-### Core
-| Function | Description |
-|----------|-------------|
-| `Adamah()` | Initialize GPU context |
-| `shutdown()` | Cleanup resources |
-
-### Memory Maps
-| Function | Description |
-|----------|-------------|
-| `map_init(id, word_size, pack_size, n_packs)` | Create map |
-| `map_destroy(id)` | Destroy map |
-| `map_size(id)` | Get number of packs |
-| `map_save(id, path)` | Save to file |
-| `map_load(id, path)` | Load from file |
-
-### Data Transfer (CPU ↔ GPU)
-| Function | Description |
-|----------|-------------|
-| `scatter(id, locs, data)` | Write data to map[locs] |
-| `gather(id, locs)` | Read data from map[locs] |
-
-### GPU Operations
-| Function | Description |
-|----------|-------------|
-| `map_op1(id, op, src, dst)` | Unary: map[dst] = op(map[src]) |
-| `map_op2(id, op, a, b, dst)` | Binary: map[dst] = map[a] op map[b] |
-
-**Shortcuts:**
-- `map_sin`, `map_cos`, `map_exp`, `map_tanh`, `map_relu`
-- `map_add`, `map_mul`
-
-### Operations
-
-**Unary (OP_*):** NEG, ABS, SQRT, EXP, LOG, TANH, RELU, GELU, SIN, COS, RECIP, SQR
-
-**Binary (OP_*):** ADD, SUB, MUL, DIV, POW, MIN, MAX
-
-## Example: Neural Network Embedding
+## Matrix Multiplication
 
 ```python
-gpu = adamah.Adamah()
-
-# Embedding table: 50k vectors of 768 dims
-gpu.map_init(0, word_size=4, pack_size=768, n_packs=50_000)
-
-# Load pretrained embeddings
-gpu.scatter(0, all_indices, embeddings)
-
-# Lookup batch of 32 tokens
-batch_locs = np.array([tok1, tok2, ..., tok32], dtype=np.uint32)
-vectors = gpu.gather(0, batch_locs)  # Shape: (32 * 768,)
-
-# GPU-side operations on embeddings
-gpu.map_sin(0, batch_locs, output_locs)  # Apply activation
+# C = A @ B  (batched)
+gpu.map_matmul(map_id, locs_A, locs_B, locs_C, M, K, N)
 ```
+
+## Softmax (using reduce + broadcast)
+
+```python
+# softmax = exp(x - max) / sum(exp(x - max))
+gpu.map_reduce_max(0, x_locs, max_locs)      # max per row
+gpu.map_broadcast(0, BROADCAST_SUB, x_locs, max_locs, tmp_locs)  # x - max
+gpu.map_exp(0, tmp_locs, tmp_locs)           # exp
+gpu.map_reduce_sum(0, tmp_locs, sum_locs)    # sum
+gpu.map_div_scalar(0, tmp_locs, sum_locs, out_locs)  # normalize
+```
+
+## API Reference
+
+| Function | Description |
+|----------|-------------|
+| `map_init(id, word_size, pack_size, n_packs)` | Create GPU memory map |
+| `scatter(id, locs, data)` | CPU → GPU transfer |
+| `gather(id, locs)` | GPU → CPU transfer |
+| `map_matmul(id, A, B, C, M, K, N)` | Matrix multiplication |
+| `map_reduce_sum/max/min(id, src, dst)` | Reduce along pack |
+| `map_scale(id, src, scalar, dst)` | Broadcast multiply |
+| `map_op1(id, op, src, dst)` | Unary ops (sin, exp, gelu...) |
+| `map_op2(id, op, a, b, dst)` | Binary ops (add, mul...) |
+
+## Operations
+
+**Unary**: NEG, ABS, SQRT, EXP, LOG, TANH, RELU, GELU, SIN, COS, RECIP, SQR
+
+**Binary**: ADD, SUB, MUL, DIV, POW, MIN, MAX
+
+**Reduce**: SUM, MAX, MIN
+
+**Broadcast**: MUL, DIV, ADD, SUB
 
 ## Performance
 
-- **Zero-copy GPU ops**: Operations stay in VRAM
-- **Sparse access**: scatter/gather by pack index
-- **Async execution**: Vulkan compute shaders
-- **65+ GB/s** memory bandwidth on RTX 3070 (to further validate on bigger ops)
+- 65+ GB/s memory bandwidth on RTX 3070
+- Zero-copy GPU compute (data stays in VRAM)
+- Cross-platform via Vulkan (NVIDIA, AMD, Intel)
+
+## Requirements
+
+- Linux (Ubuntu 20.04+)
+- Vulkan drivers (`vulkaninfo` to check)
+- GCC (`build-essential`)
+- Python 3.8+
 
 ## License
 
-**CC BY-NC 4.0** - Creative Commons Attribution-NonCommercial 4.0
+**CC BY-NC 4.0** - Free for non-commercial use with attribution.
 
-Copyright (c) 2026 Samuele Scuglia
-
-Free for non-commercial use with attribution.
+© 2026 Samuele Scuglia

@@ -1,0 +1,60 @@
+#version 450
+
+layout(local_size_x = 256) in;
+
+layout(push_constant) uniform PushConstants {
+    uint op_code;
+    uint n_locs;        // Number of locations to process
+    uint pack_size;     // Elements per pack
+} pc;
+
+// Map data buffer
+layout(std430, binding = 0) buffer MapBuffer {
+    float map_data[];
+};
+
+// Locations for operand A
+layout(std430, binding = 1) buffer LocsA {
+    uint locs_a[];
+};
+
+// Locations for operand B
+layout(std430, binding = 2) buffer LocsB {
+    uint locs_b[];
+};
+
+// Destination locations
+layout(std430, binding = 3) buffer LocsDst {
+    uint locs_dst[];
+};
+
+void main() {
+    uint tid = gl_GlobalInvocationID.x;
+    
+    uint loc_idx = tid / pc.pack_size;
+    uint elem_idx = tid % pc.pack_size;
+    
+    if (loc_idx >= pc.n_locs) return;
+    
+    // Offsets in map
+    uint a_offset = locs_a[loc_idx] * pc.pack_size + elem_idx;
+    uint b_offset = locs_b[loc_idx] * pc.pack_size + elem_idx;
+    uint dst_offset = locs_dst[loc_idx] * pc.pack_size + elem_idx;
+    
+    float a = map_data[a_offset];
+    float b = map_data[b_offset];
+    float result;
+    
+    switch (pc.op_code) {
+        case 0: result = a + b; break;              // ADD
+        case 1: result = a - b; break;              // SUB
+        case 2: result = a * b; break;              // MUL
+        case 3: result = a / b; break;              // DIV
+        case 4: result = pow(a, b); break;          // POW
+        case 5: result = min(a, b); break;          // MIN
+        case 6: result = max(a, b); break;          // MAX
+        default: result = a; break;
+    }
+    
+    map_data[dst_offset] = result;
+}
