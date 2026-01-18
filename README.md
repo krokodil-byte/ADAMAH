@@ -20,7 +20,7 @@ Pure GPU operations on Memory Maps with scatter/gather for CPU I/O.
 └─────────────────────────────────────────────────────────────┘
 ```
 
-## Installation
+## Installation (Legacy, soon available)
 
 ```bash
 pip install adamah
