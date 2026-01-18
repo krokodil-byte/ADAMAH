@@ -120,7 +120,7 @@ gpu.map_sin(0, batch_locs, output_locs)  # Apply activation
 - **Zero-copy GPU ops**: Operations stay in VRAM
 - **Sparse access**: scatter/gather by pack index
 - **Async execution**: Vulkan compute shaders
-- **65+ GB/s** memory bandwidth on RTX 3070
+- **65+ GB/s** memory bandwidth on RTX 3070 (to further validate on bigger ops)
 
 ## License
 
