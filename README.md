@@ -88,12 +88,6 @@ gpu.map_div_scalar(0, tmp_locs, sum_locs, out_locs)  # normalize
 
 **Broadcast**: MUL, DIV, ADD, SUB
 
-## Performance
-
-- 65 GB/s (adamah) vs 80GB/s (cupy) memory bandwidth on RTX 3070 on same tasks
-- Zero-copy GPU compute (data stays in VRAM)
-- Cross-platform via Vulkan (NVIDIA, AMD, Intel)
-
 ## Requirements
 
 - Linux (Ubuntu 20.04+)
