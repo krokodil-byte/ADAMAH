@@ -1,4 +1,4 @@
-# ADAMAH v4.0.0
+# ADAMAH v4.0.0 (soon avalabile on pypi)
 
 **Map-Centric GPU Compute Library**
 
