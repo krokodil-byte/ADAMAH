@@ -1,6 +1,6 @@
-# ADAMAH v4.1.0
+# ADAMAH v4.3.0
 
-**Map-Centric GPU Compute Library for AI/ML**
+**Vulkan to FFI GPU Compute Library*
 
 Zero-CUDA alternative using Vulkan. Supports transformers, embeddings, and neural network operations.
 
