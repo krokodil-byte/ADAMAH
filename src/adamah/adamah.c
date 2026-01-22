@@ -95,6 +95,9 @@ static struct {
     Pipeline matmul_pipe;
     Pipeline reduce_pipe;
     Pipeline broadcast_pipe;
+    Pipeline softmax_pipe;
+    Pipeline layernorm_pipe;
+    Pipeline unified_pipe;
     
     char shader_path[512];
 } ctx = {0};
@@ -151,21 +154,126 @@ static int create_buffer(VkBuffer* buf, VkDeviceMemory* mem, VkDeviceSize size,
     return 0;
 }
 
+// ============================================
+// True Vulkan Batching - accumulate in single command buffer
+// ============================================
+static int batch_mode = 0;
+static int cmd_recording = 0;  // Is command buffer currently recording?
+static int batch_op_counter = 0;  // Counter for unique buffer names in batch
+
+static VkDescriptorSet alloc_desc_set(Pipeline* p) {
+    VkDescriptorSet ds = p->desc_set;
+    if (batch_mode) {
+        VkDescriptorSetAllocateInfo dsai = { .sType = VK_STRUCTURE_TYPE_DESCRIPTOR_SET_ALLOCATE_INFO,
+            .descriptorPool = p->desc_pool, .descriptorSetCount = 1, .pSetLayouts = &p->desc_layout };
+        if (vkAllocateDescriptorSets(ctx.device, &dsai, &ds) != VK_SUCCESS) return VK_NULL_HANDLE;
+    }
+    return ds;
+}
+
+static void cmd_barrier_after_dispatch(void) {
+    if (!batch_mode) return;
+    VkMemoryBarrier mb = { .sType = VK_STRUCTURE_TYPE_MEMORY_BARRIER,
+        .srcAccessMask = VK_ACCESS_SHADER_WRITE_BIT,
+        .dstAccessMask = VK_ACCESS_SHADER_READ_BIT | VK_ACCESS_SHADER_WRITE_BIT };
+    vkCmdPipelineBarrier(ctx.cmd,
+        VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT,
+        VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT,
+        0, 1, &mb, 0, NULL, 0, NULL);
+}
+
+static void reset_pipeline_desc_pool(Pipeline* p) {
+    if (!p->desc_pool) return;
+    vkResetDescriptorPool(ctx.device, p->desc_pool, 0);
+    VkDescriptorSetAllocateInfo dsai = { .sType = VK_STRUCTURE_TYPE_DESCRIPTOR_SET_ALLOCATE_INFO,
+        .descriptorPool = p->desc_pool, .descriptorSetCount = 1, .pSetLayouts = &p->desc_layout };
+    if (vkAllocateDescriptorSets(ctx.device, &dsai, &p->desc_set) != VK_SUCCESS) {
+        p->desc_set = VK_NULL_HANDLE;
+    }
+}
+
 static void cmd_begin(void) {
+    if (batch_mode && cmd_recording) {
+        // Already recording in batch mode, just continue adding commands
+        return;
+    }
+    
+    // Wait for previous work to complete
     vkWaitForFences(ctx.device, 1, &ctx.fence, VK_TRUE, UINT64_MAX);
     vkResetFences(ctx.device, 1, &ctx.fence);
     vkResetCommandBuffer(ctx.cmd, 0);
+    
     VkCommandBufferBeginInfo cbi = { .sType = VK_STRUCTURE_TYPE_COMMAND_BUFFER_BEGIN_INFO,
         .flags = VK_COMMAND_BUFFER_USAGE_ONE_TIME_SUBMIT_BIT };
     vkBeginCommandBuffer(ctx.cmd, &cbi);
+    cmd_recording = 1;
 }
 
 static void cmd_submit(void) {
+    if (batch_mode) {
+        // In batch mode, don't submit yet - keep accumulating
+        // Increment counter for next op to use different buffers
+        batch_op_counter++;
+        return;
+    }
+    
+    if (!cmd_recording) return;
+    
     vkEndCommandBuffer(ctx.cmd);
     VkSubmitInfo si = { .sType = VK_STRUCTURE_TYPE_SUBMIT_INFO,
         .commandBufferCount = 1, .pCommandBuffers = &ctx.cmd };
     vkQueueSubmit(ctx.queue, 1, &si, ctx.fence);
     vkWaitForFences(ctx.device, 1, &ctx.fence, VK_TRUE, UINT64_MAX);
+    cmd_recording = 0;
+}
+
+// Start batch mode - commands accumulated into single command buffer
+void batch_begin(void) {
+    // Ensure clean state
+    if (cmd_recording) {
+        vkEndCommandBuffer(ctx.cmd);
+        VkSubmitInfo si = { .sType = VK_STRUCTURE_TYPE_SUBMIT_INFO,
+            .commandBufferCount = 1, .pCommandBuffers = &ctx.cmd };
+        vkQueueSubmit(ctx.queue, 1, &si, ctx.fence);
+        vkWaitForFences(ctx.device, 1, &ctx.fence, VK_TRUE, UINT64_MAX);
+        cmd_recording = 0;
+    }
+    batch_mode = 1;
+    batch_op_counter = 0;  // Reset counter for new batch
+}
+
+// End batch mode - submit all accumulated commands
+void batch_end(void) {
+    if (!batch_mode) return;
+    
+    batch_mode = 0;
+    
+    if (cmd_recording) {
+        vkEndCommandBuffer(ctx.cmd);
+        VkSubmitInfo si = { .sType = VK_STRUCTURE_TYPE_SUBMIT_INFO,
+            .commandBufferCount = 1, .pCommandBuffers = &ctx.cmd };
+        vkQueueSubmit(ctx.queue, 1, &si, ctx.fence);
+        vkWaitForFences(ctx.device, 1, &ctx.fence, VK_TRUE, UINT64_MAX);
+        cmd_recording = 0;
+    }
+
+    // Batch completed, recycle descriptor sets for next batch
+    reset_pipeline_desc_pool(&ctx.unary_pipe);
+    reset_pipeline_desc_pool(&ctx.binary_pipe);
+    reset_pipeline_desc_pool(&ctx.matmul_pipe);
+    reset_pipeline_desc_pool(&ctx.reduce_pipe);
+    reset_pipeline_desc_pool(&ctx.broadcast_pipe);
+    reset_pipeline_desc_pool(&ctx.softmax_pipe);
+    reset_pipeline_desc_pool(&ctx.layernorm_pipe);
+    reset_pipeline_desc_pool(&ctx.unified_pipe);
+    
+    batch_op_counter = 0;  // Reset counter
+}
+
+// Sync: wait for all queued GPU work to finish
+void adamah_sync(void) {
+    if (!ctx.initialized) return;
+    vkDeviceWaitIdle(ctx.device);
 }
 
 // ============================================
@@ -316,6 +424,18 @@ uint64_t map_size(uint32_t id) {
 // Scatter / Gather (CPU <-> Map)
 // ============================================
 
+static int locs_contiguous_in_range(const uint32_t* locs, uint32_t n_locs, uint32_t n_packs, uint32_t* start_out) {
+    if (n_locs == 0) return 0;
+    uint32_t start = locs[0];
+    if (start >= n_packs) return 0;
+    if ((uint64_t)start + (uint64_t)n_locs > (uint64_t)n_packs) return 0;
+    for (uint32_t i = 1; i < n_locs; i++) {
+        if (locs[i] != start + i) return 0;
+    }
+    if (start_out) *start_out = start;
+    return 1;
+}
+
 // Scatter: write data to map at locations
 // locs: array of pack indices (uint32)
 // data: packed data (n_locs * pack_size * word_size bytes)
@@ -324,20 +444,61 @@ int mscatter(uint32_t map_id, const uint32_t* locs, const void* data, uint32_t n
     Map* m = &ctx.maps[map_id];
     uint32_t pack_bytes = m->word_size * m->pack_size;
     
-    // Copy to staging at correct offsets
+    if (n_locs == 0) return ADAMAH_OK;
+
+    // Fast path: contiguous locs
+    uint32_t start = 0;
+    if (locs_contiguous_in_range(locs, n_locs, m->n_packs, &start)) {
+        size_t off = (size_t)start * pack_bytes;
+        size_t size = (size_t)n_locs * pack_bytes;
+        memcpy((char*)m->staging_ptr + off, data, size);
+        cmd_begin();
+        VkBufferCopy copy = { .srcOffset = off, .dstOffset = off, .size = size };
+        vkCmdCopyBuffer(ctx.cmd, m->staging, m->buf, 1, &copy);
+        cmd_submit();
+        return ADAMAH_OK;
+    }
+
+    // Heuristic: for very large writes, full buffer copy is cheaper than many regions.
+    if ((uint64_t)n_locs * (uint64_t)pack_bytes >= (uint64_t)m->total_bytes / 2) {
+        const char* src = (const char*)data;
+        char* staging = (char*)m->staging_ptr;
+        for (uint32_t i = 0; i < n_locs; i++) {
+            uint32_t loc = locs[i];
+            if (loc >= m->n_packs) continue;
+            memcpy(staging + (size_t)loc * pack_bytes, src + (size_t)i * pack_bytes, pack_bytes);
+        }
+        cmd_begin();
+        VkBufferCopy copy = { .size = m->total_bytes };
+        vkCmdCopyBuffer(ctx.cmd, m->staging, m->buf, 1, &copy);
+        cmd_submit();
+        return ADAMAH_OK;
+    }
+
+    // Sparse copy: build per-loc regions.
     const char* src = (const char*)data;
     char* staging = (char*)m->staging_ptr;
+    VkBufferCopy* regions = (VkBufferCopy*)malloc(sizeof(VkBufferCopy) * n_locs);
+    if (!regions) return ADAMAH_ERR_MEMORY;
+    uint32_t rcount = 0;
+
     for (uint32_t i = 0; i < n_locs; i++) {
         uint32_t loc = locs[i];
         if (loc >= m->n_packs) continue;
-        memcpy(staging + loc * pack_bytes, src + i * pack_bytes, pack_bytes);
+        size_t off = (size_t)loc * pack_bytes;
+        memcpy(staging + off, src + (size_t)i * pack_bytes, pack_bytes);
+        regions[rcount].srcOffset = off;
+        regions[rcount].dstOffset = off;
+        regions[rcount].size = pack_bytes;
+        rcount++;
     }
-    
-    // Upload to GPU
-    cmd_begin();
-    VkBufferCopy copy = { .size = m->total_bytes };
-    vkCmdCopyBuffer(ctx.cmd, m->staging, m->buf, 1, &copy);
-    cmd_submit();
+
+    if (rcount > 0) {
+        cmd_begin();
+        vkCmdCopyBuffer(ctx.cmd, m->staging, m->buf, rcount, regions);
+        cmd_submit();
+    }
+    free(regions);
     
     return ADAMAH_OK;
 }
@@ -348,19 +509,65 @@ int mgather(uint32_t map_id, const uint32_t* locs, void* data, uint32_t n_locs) 
     Map* m = &ctx.maps[map_id];
     uint32_t pack_bytes = m->word_size * m->pack_size;
     
-    // Download from GPU
-    cmd_begin();
-    VkBufferCopy copy = { .size = m->total_bytes };
-    vkCmdCopyBuffer(ctx.cmd, m->buf, m->staging, 1, &copy);
-    cmd_submit();
-    
+    if (n_locs == 0) return ADAMAH_OK;
+
+    // Fast path: contiguous locs
+    uint32_t start = 0;
+    if (locs_contiguous_in_range(locs, n_locs, m->n_packs, &start)) {
+        size_t off = (size_t)start * pack_bytes;
+        size_t size = (size_t)n_locs * pack_bytes;
+        cmd_begin();
+        VkBufferCopy copy = { .srcOffset = off, .dstOffset = off, .size = size };
+        vkCmdCopyBuffer(ctx.cmd, m->buf, m->staging, 1, &copy);
+        cmd_submit();
+        memcpy(data, (char*)m->staging_ptr + off, size);
+        return ADAMAH_OK;
+    }
+
+    // Heuristic: large reads -> full buffer copy
+    if ((uint64_t)n_locs * (uint64_t)pack_bytes >= (uint64_t)m->total_bytes / 2) {
+        cmd_begin();
+        VkBufferCopy copy = { .size = m->total_bytes };
+        vkCmdCopyBuffer(ctx.cmd, m->buf, m->staging, 1, &copy);
+        cmd_submit();
+        char* dst = (char*)data;
+        const char* staging = (const char*)m->staging_ptr;
+        for (uint32_t i = 0; i < n_locs; i++) {
+            uint32_t loc = locs[i];
+            if (loc >= m->n_packs) continue;
+            memcpy(dst + (size_t)i * pack_bytes, staging + (size_t)loc * pack_bytes, pack_bytes);
+        }
+        return ADAMAH_OK;
+    }
+
+    VkBufferCopy* regions = (VkBufferCopy*)malloc(sizeof(VkBufferCopy) * n_locs);
+    if (!regions) return ADAMAH_ERR_MEMORY;
+    uint32_t rcount = 0;
+
+    for (uint32_t i = 0; i < n_locs; i++) {
+        uint32_t loc = locs[i];
+        if (loc >= m->n_packs) continue;
+        size_t off = (size_t)loc * pack_bytes;
+        regions[rcount].srcOffset = off;
+        regions[rcount].dstOffset = off;
+        regions[rcount].size = pack_bytes;
+        rcount++;
+    }
+
+    if (rcount > 0) {
+        cmd_begin();
+        vkCmdCopyBuffer(ctx.cmd, m->buf, m->staging, rcount, regions);
+        cmd_submit();
+    }
+    free(regions);
+
     // Copy from staging
     char* dst = (char*)data;
     const char* staging = (const char*)m->staging_ptr;
     for (uint32_t i = 0; i < n_locs; i++) {
         uint32_t loc = locs[i];
         if (loc >= m->n_packs) continue;
-        memcpy(dst + i * pack_bytes, staging + loc * pack_bytes, pack_bytes);
+        memcpy(dst + (size_t)i * pack_bytes, staging + (size_t)loc * pack_bytes, pack_bytes);
     }
     
     return ADAMAH_OK;
@@ -450,8 +657,8 @@ static int create_pipeline(Pipeline* p, const char* shader_name, int num_binding
     if (res != VK_SUCCESS) return ADAMAH_ERR_VULKAN;
     
     // Descriptor set layout
-    VkDescriptorSetLayoutBinding bindings[4];
-    for (int i = 0; i < num_bindings; i++) {
+    VkDescriptorSetLayoutBinding bindings[8];  // Max 8 bindings
+    for (int i = 0; i < num_bindings && i < 8; i++) {
         bindings[i] = (VkDescriptorSetLayoutBinding){
             .binding = i, .descriptorType = VK_DESCRIPTOR_TYPE_STORAGE_BUFFER,
             .descriptorCount = 1, .stageFlags = VK_SHADER_STAGE_COMPUTE_BIT };
@@ -475,9 +682,11 @@ static int create_pipeline(Pipeline* p, const char* shader_name, int num_binding
     vkCreateComputePipelines(ctx.device, VK_NULL_HANDLE, 1, &cpci, NULL, &p->pipeline);
     
     // Descriptor pool
-    VkDescriptorPoolSize pool_size = { .type = VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, .descriptorCount = num_bindings };
+    const uint32_t max_sets = 1024;
+    VkDescriptorPoolSize pool_size = { .type = VK_DESCRIPTOR_TYPE_STORAGE_BUFFER,
+        .descriptorCount = (uint32_t)num_bindings * max_sets };
     VkDescriptorPoolCreateInfo dpci = { .sType = VK_STRUCTURE_TYPE_DESCRIPTOR_POOL_CREATE_INFO,
-        .maxSets = 1, .poolSizeCount = 1, .pPoolSizes = &pool_size };
+        .maxSets = max_sets, .poolSizeCount = 1, .pPoolSizes = &pool_size };
     vkCreateDescriptorPool(ctx.device, &dpci, NULL, &p->desc_pool);
     
     // Allocate descriptor set
@@ -551,6 +760,21 @@ static int init_pipelines(void) {
         fprintf(stderr, "ADAMAH: Warning - broadcast shader not found\n");
     }
     
+    // Softmax: n_rows, row_size = 8 bytes, 3 bindings
+    if (create_pipeline(&ctx.softmax_pipe, "map_softmax.spv", 3, 8) != 0) {
+        fprintf(stderr, "ADAMAH: Warning - softmax shader not found\n");
+    }
+    
+    // LayerNorm: n_rows, dim, eps = 12 bytes, 5 bindings
+    if (create_pipeline(&ctx.layernorm_pipe, "map_layernorm.spv", 5, 12) != 0) {
+        fprintf(stderr, "ADAMAH: Warning - layernorm shader not found\n");
+    }
+
+    // Unified FFN: BT, D, D4, apply_residual, phase = 20 bytes, 7 bindings
+    if (create_pipeline(&ctx.unified_pipe, "unified.spv", 7, 20) != 0) {
+        fprintf(stderr, "ADAMAH: Warning - unified shader not found\n");
+    }
+    
     return ADAMAH_OK;
 }
 
@@ -558,7 +782,16 @@ static int init_pipelines(void) {
 // Internal GPU buffers for locations
 // ============================================
 
-static GpuBuf* get_or_create_buf(const char* name, uint32_t n_elems, uint32_t elem_size) {
+static GpuBuf* get_or_create_buf(const char* base_name, uint32_t n_elems, uint32_t elem_size) {
+    // In batch mode, create unique buffer name for each op
+    char name[64];
+    if (batch_mode) {
+        snprintf(name, sizeof(name), "%s_%d", base_name, batch_op_counter);
+    } else {
+        strncpy(name, base_name, 63);
+        name[63] = 0;
+    }
+    
     // Find existing
     for (int i = 0; i < ctx.buf_count; i++) {
         if (strcmp(ctx.bufs[i].name, name) == 0) {
@@ -612,6 +845,9 @@ int map_op1(uint32_t map_id, uint32_t op, const uint32_t* locs_src, const uint32
     memcpy(src_buf->ptr, locs_src, n * 4);
     memcpy(dst_buf->ptr, locs_dst, n * 4);
     
+    VkDescriptorSet ds = alloc_desc_set(&ctx.unary_pipe);
+    if (ds == VK_NULL_HANDLE) return ADAMAH_ERR_VULKAN;
+
     // Update descriptor set
     VkDescriptorBufferInfo buf_infos[3] = {
         { .buffer = m->buf, .range = VK_WHOLE_SIZE },
@@ -621,7 +857,7 @@ int map_op1(uint32_t map_id, uint32_t op, const uint32_t* locs_src, const uint32
     VkWriteDescriptorSet writes[3];
     for (int i = 0; i < 3; i++) {
         writes[i] = (VkWriteDescriptorSet){ .sType = VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET,
-            .dstSet = ctx.unary_pipe.desc_set, .dstBinding = i, .descriptorCount = 1,
+            .dstSet = ds, .dstBinding = i, .descriptorCount = 1,
             .descriptorType = VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, .pBufferInfo = &buf_infos[i] };
     }
     vkUpdateDescriptorSets(ctx.device, 3, writes, 0, NULL);
@@ -634,9 +870,10 @@ int map_op1(uint32_t map_id, uint32_t op, const uint32_t* locs_src, const uint32
     cmd_begin();
     vkCmdBindPipeline(ctx.cmd, VK_PIPELINE_BIND_POINT_COMPUTE, ctx.unary_pipe.pipeline);
     vkCmdBindDescriptorSets(ctx.cmd, VK_PIPELINE_BIND_POINT_COMPUTE, ctx.unary_pipe.pipe_layout,
-                            0, 1, &ctx.unary_pipe.desc_set, 0, NULL);
+                            0, 1, &ds, 0, NULL);
     vkCmdPushConstants(ctx.cmd, ctx.unary_pipe.pipe_layout, VK_SHADER_STAGE_COMPUTE_BIT, 0, 12, push);
     vkCmdDispatch(ctx.cmd, (total_threads + 255) / 256, 1, 1);
+    cmd_barrier_after_dispatch();
     cmd_submit();
     
     return ADAMAH_OK;
@@ -659,6 +896,9 @@ int map_op2(uint32_t map_id, uint32_t op,
     memcpy(b_buf->ptr, locs_b, n * 4);
     memcpy(dst_buf->ptr, locs_dst, n * 4);
     
+    VkDescriptorSet ds = alloc_desc_set(&ctx.binary_pipe);
+    if (ds == VK_NULL_HANDLE) return ADAMAH_ERR_VULKAN;
+
     // Update descriptor set
     VkDescriptorBufferInfo buf_infos[4] = {
         { .buffer = m->buf, .range = VK_WHOLE_SIZE },
@@ -669,7 +909,7 @@ int map_op2(uint32_t map_id, uint32_t op,
     VkWriteDescriptorSet writes[4];
     for (int i = 0; i < 4; i++) {
         writes[i] = (VkWriteDescriptorSet){ .sType = VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET,
-            .dstSet = ctx.binary_pipe.desc_set, .dstBinding = i, .descriptorCount = 1,
+            .dstSet = ds, .dstBinding = i, .descriptorCount = 1,
             .descriptorType = VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, .pBufferInfo = &buf_infos[i] };
     }
     vkUpdateDescriptorSets(ctx.device, 4, writes, 0, NULL);
@@ -682,9 +922,10 @@ int map_op2(uint32_t map_id, uint32_t op,
     cmd_begin();
     vkCmdBindPipeline(ctx.cmd, VK_PIPELINE_BIND_POINT_COMPUTE, ctx.binary_pipe.pipeline);
     vkCmdBindDescriptorSets(ctx.cmd, VK_PIPELINE_BIND_POINT_COMPUTE, ctx.binary_pipe.pipe_layout,
-                            0, 1, &ctx.binary_pipe.desc_set, 0, NULL);
+                            0, 1, &ds, 0, NULL);
     vkCmdPushConstants(ctx.cmd, ctx.binary_pipe.pipe_layout, VK_SHADER_STAGE_COMPUTE_BIT, 0, 12, push);
     vkCmdDispatch(ctx.cmd, (total_threads + 255) / 256, 1, 1);
+    cmd_barrier_after_dispatch();
     cmd_submit();
     
     return ADAMAH_OK;
@@ -713,6 +954,9 @@ int map_matmul(uint32_t map_id,
     memcpy(b_buf->ptr, locs_b, n_ops * 4);
     memcpy(c_buf->ptr, locs_c, n_ops * 4);
     
+    VkDescriptorSet ds = alloc_desc_set(&ctx.matmul_pipe);
+    if (ds == VK_NULL_HANDLE) return ADAMAH_ERR_VULKAN;
+
     // Update descriptor set
     VkDescriptorBufferInfo buf_infos[4] = {
         { .buffer = m->buf, .range = VK_WHOLE_SIZE },
@@ -723,7 +967,7 @@ int map_matmul(uint32_t map_id,
     VkWriteDescriptorSet writes[4];
     for (int i = 0; i < 4; i++) {
         writes[i] = (VkWriteDescriptorSet){ .sType = VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET,
-            .dstSet = ctx.matmul_pipe.desc_set, .dstBinding = i, .descriptorCount = 1,
+            .dstSet = ds, .dstBinding = i, .descriptorCount = 1,
             .descriptorType = VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, .pBufferInfo = &buf_infos[i] };
     }
     vkUpdateDescriptorSets(ctx.device, 4, writes, 0, NULL);
@@ -738,9 +982,10 @@ int map_matmul(uint32_t map_id,
     cmd_begin();
     vkCmdBindPipeline(ctx.cmd, VK_PIPELINE_BIND_POINT_COMPUTE, ctx.matmul_pipe.pipeline);
     vkCmdBindDescriptorSets(ctx.cmd, VK_PIPELINE_BIND_POINT_COMPUTE, ctx.matmul_pipe.pipe_layout,
-                            0, 1, &ctx.matmul_pipe.desc_set, 0, NULL);
+                            0, 1, &ds, 0, NULL);
     vkCmdPushConstants(ctx.cmd, ctx.matmul_pipe.pipe_layout, VK_SHADER_STAGE_COMPUTE_BIT, 0, 16, push);
     vkCmdDispatch(ctx.cmd, grid_x, grid_y, n_ops);
+    cmd_barrier_after_dispatch();
     cmd_submit();
     
     return ADAMAH_OK;
@@ -768,6 +1013,9 @@ int map_reduce(uint32_t map_id, uint32_t op,
     memcpy(src_buf->ptr, locs_src, n * 4);
     memcpy(dst_buf->ptr, locs_dst, n * 4);
     
+    VkDescriptorSet ds = alloc_desc_set(&ctx.reduce_pipe);
+    if (ds == VK_NULL_HANDLE) return ADAMAH_ERR_VULKAN;
+
     VkDescriptorBufferInfo buf_infos[3] = {
         { .buffer = m->buf, .range = VK_WHOLE_SIZE },
         { .buffer = src_buf->buf, .range = VK_WHOLE_SIZE },
@@ -776,7 +1024,7 @@ int map_reduce(uint32_t map_id, uint32_t op,
     VkWriteDescriptorSet writes[3];
     for (int i = 0; i < 3; i++) {
         writes[i] = (VkWriteDescriptorSet){ .sType = VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET,
-            .dstSet = ctx.reduce_pipe.desc_set, .dstBinding = i, .descriptorCount = 1,
+            .dstSet = ds, .dstBinding = i, .descriptorCount = 1,
             .descriptorType = VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, .pBufferInfo = &buf_infos[i] };
     }
     vkUpdateDescriptorSets(ctx.device, 3, writes, 0, NULL);
@@ -788,9 +1036,10 @@ int map_reduce(uint32_t map_id, uint32_t op,
     cmd_begin();
     vkCmdBindPipeline(ctx.cmd, VK_PIPELINE_BIND_POINT_COMPUTE, ctx.reduce_pipe.pipeline);
     vkCmdBindDescriptorSets(ctx.cmd, VK_PIPELINE_BIND_POINT_COMPUTE, ctx.reduce_pipe.pipe_layout,
-                            0, 1, &ctx.reduce_pipe.desc_set, 0, NULL);
+                            0, 1, &ds, 0, NULL);
     vkCmdPushConstants(ctx.cmd, ctx.reduce_pipe.pipe_layout, VK_SHADER_STAGE_COMPUTE_BIT, 0, 12, push);
     vkCmdDispatch(ctx.cmd, n, 1, 1);
+    cmd_barrier_after_dispatch();
     cmd_submit();
     
     return ADAMAH_OK;
@@ -823,6 +1072,9 @@ int map_broadcast(uint32_t map_id, uint32_t op,
     memcpy(scalar_buf->ptr, locs_scalar, n * 4);
     memcpy(dst_buf->ptr, locs_dst, n * 4);
     
+    VkDescriptorSet ds = alloc_desc_set(&ctx.broadcast_pipe);
+    if (ds == VK_NULL_HANDLE) return ADAMAH_ERR_VULKAN;
+
     VkDescriptorBufferInfo buf_infos[4] = {
         { .buffer = m->buf, .range = VK_WHOLE_SIZE },
         { .buffer = src_buf->buf, .range = VK_WHOLE_SIZE },
@@ -832,7 +1084,7 @@ int map_broadcast(uint32_t map_id, uint32_t op,
     VkWriteDescriptorSet writes[4];
     for (int i = 0; i < 4; i++) {
         writes[i] = (VkWriteDescriptorSet){ .sType = VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET,
-            .dstSet = ctx.broadcast_pipe.desc_set, .dstBinding = i, .descriptorCount = 1,
+            .dstSet = ds, .dstBinding = i, .descriptorCount = 1,
             .descriptorType = VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, .pBufferInfo = &buf_infos[i] };
     }
     vkUpdateDescriptorSets(ctx.device, 4, writes, 0, NULL);
@@ -844,10 +1096,203 @@ int map_broadcast(uint32_t map_id, uint32_t op,
     cmd_begin();
     vkCmdBindPipeline(ctx.cmd, VK_PIPELINE_BIND_POINT_COMPUTE, ctx.broadcast_pipe.pipeline);
     vkCmdBindDescriptorSets(ctx.cmd, VK_PIPELINE_BIND_POINT_COMPUTE, ctx.broadcast_pipe.pipe_layout,
-                            0, 1, &ctx.broadcast_pipe.desc_set, 0, NULL);
+                            0, 1, &ds, 0, NULL);
     vkCmdPushConstants(ctx.cmd, ctx.broadcast_pipe.pipe_layout, VK_SHADER_STAGE_COMPUTE_BIT, 0, 12, push);
     vkCmdDispatch(ctx.cmd, (total_threads + 255) / 256, 1, 1);
+    cmd_barrier_after_dispatch();
     cmd_submit();
     
+    return ADAMAH_OK;
+}
+
+// ============================================
+// Softmax: fused max-subtract-exp-sum-normalize
+// ============================================
+int map_softmax(uint32_t map_id, 
+                const uint32_t* locs_src, const uint32_t* locs_dst,
+                uint32_t n_rows, uint32_t row_size) {
+    if (map_id >= MAX_MAPS || !ctx.maps[map_id].active) return ADAMAH_ERR_INVALID;
+    if (!ctx.softmax_pipe.pipeline && init_pipelines() != 0) return ADAMAH_ERR_VULKAN;
+    if (!ctx.softmax_pipe.pipeline) return ADAMAH_ERR_INVALID;
+    
+    Map* m = &ctx.maps[map_id];
+    
+    GpuBuf* src_buf = get_or_create_buf("_softmax_src", n_rows, 4);
+    GpuBuf* dst_buf = get_or_create_buf("_softmax_dst", n_rows, 4);
+    if (!src_buf || !dst_buf) return ADAMAH_ERR_MEMORY;
+    
+    memcpy(src_buf->ptr, locs_src, n_rows * 4);
+    memcpy(dst_buf->ptr, locs_dst, n_rows * 4);
+    
+    VkDescriptorSet ds = alloc_desc_set(&ctx.softmax_pipe);
+    if (ds == VK_NULL_HANDLE) return ADAMAH_ERR_VULKAN;
+
+    VkDescriptorBufferInfo buf_infos[3] = {
+        { .buffer = m->buf, .range = VK_WHOLE_SIZE },
+        { .buffer = src_buf->buf, .range = VK_WHOLE_SIZE },
+        { .buffer = dst_buf->buf, .range = VK_WHOLE_SIZE }
+    };
+    VkWriteDescriptorSet writes[3];
+    for (int i = 0; i < 3; i++) {
+        writes[i] = (VkWriteDescriptorSet){ .sType = VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET,
+            .dstSet = ds, .dstBinding = i, .descriptorCount = 1,
+            .descriptorType = VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, .pBufferInfo = &buf_infos[i] };
+    }
+    vkUpdateDescriptorSets(ctx.device, 3, writes, 0, NULL);
+    
+    // Push: n_rows, row_size
+    uint32_t push[2] = { n_rows, row_size };
+    
+    // One workgroup per row
+    cmd_begin();
+    vkCmdBindPipeline(ctx.cmd, VK_PIPELINE_BIND_POINT_COMPUTE, ctx.softmax_pipe.pipeline);
+    vkCmdBindDescriptorSets(ctx.cmd, VK_PIPELINE_BIND_POINT_COMPUTE, ctx.softmax_pipe.pipe_layout,
+                            0, 1, &ds, 0, NULL);
+    vkCmdPushConstants(ctx.cmd, ctx.softmax_pipe.pipe_layout, VK_SHADER_STAGE_COMPUTE_BIT, 0, 8, push);
+    vkCmdDispatch(ctx.cmd, n_rows, 1, 1);
+    cmd_barrier_after_dispatch();
+    cmd_submit();
+    
+    return ADAMAH_OK;
+}
+
+// ============================================
+// LayerNorm: fused mean-var-normalize-scale-shift
+// ============================================
+int map_layernorm(uint32_t map_id,
+                  const uint32_t* locs_src, const uint32_t* locs_dst,
+                  const uint32_t* locs_gamma, const uint32_t* locs_beta,
+                  uint32_t n_rows, uint32_t dim, float eps) {
+    if (map_id >= MAX_MAPS || !ctx.maps[map_id].active) return ADAMAH_ERR_INVALID;
+    if (!ctx.layernorm_pipe.pipeline && init_pipelines() != 0) return ADAMAH_ERR_VULKAN;
+    if (!ctx.layernorm_pipe.pipeline) return ADAMAH_ERR_INVALID;
+    
+    Map* m = &ctx.maps[map_id];
+    
+    GpuBuf* src_buf = get_or_create_buf("_ln_src", n_rows, 4);
+    GpuBuf* dst_buf = get_or_create_buf("_ln_dst", n_rows, 4);
+    GpuBuf* gamma_buf = get_or_create_buf("_ln_gamma", n_rows, 4);
+    GpuBuf* beta_buf = get_or_create_buf("_ln_beta", n_rows, 4);
+    if (!src_buf || !dst_buf || !gamma_buf || !beta_buf) return ADAMAH_ERR_MEMORY;
+    
+    memcpy(src_buf->ptr, locs_src, n_rows * 4);
+    memcpy(dst_buf->ptr, locs_dst, n_rows * 4);
+    memcpy(gamma_buf->ptr, locs_gamma, n_rows * 4);
+    memcpy(beta_buf->ptr, locs_beta, n_rows * 4);
+    
+    VkDescriptorSet ds = alloc_desc_set(&ctx.layernorm_pipe);
+    if (ds == VK_NULL_HANDLE) return ADAMAH_ERR_VULKAN;
+
+    VkDescriptorBufferInfo buf_infos[5] = {
+        { .buffer = m->buf, .range = VK_WHOLE_SIZE },
+        { .buffer = src_buf->buf, .range = VK_WHOLE_SIZE },
+        { .buffer = dst_buf->buf, .range = VK_WHOLE_SIZE },
+        { .buffer = gamma_buf->buf, .range = VK_WHOLE_SIZE },
+        { .buffer = beta_buf->buf, .range = VK_WHOLE_SIZE }
+    };
+    VkWriteDescriptorSet writes[5];
+    for (int i = 0; i < 5; i++) {
+        writes[i] = (VkWriteDescriptorSet){ .sType = VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET,
+            .dstSet = ds, .dstBinding = i, .descriptorCount = 1,
+            .descriptorType = VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, .pBufferInfo = &buf_infos[i] };
+    }
+    vkUpdateDescriptorSets(ctx.device, 5, writes, 0, NULL);
+    
+    // Push: n_rows, dim, eps (as uint bits)
+    uint32_t push[3];
+    push[0] = n_rows;
+    push[1] = dim;
+    memcpy(&push[2], &eps, 4);  // Float as bits
+    
+    // One workgroup per row
+    cmd_begin();
+    vkCmdBindPipeline(ctx.cmd, VK_PIPELINE_BIND_POINT_COMPUTE, ctx.layernorm_pipe.pipeline);
+    vkCmdBindDescriptorSets(ctx.cmd, VK_PIPELINE_BIND_POINT_COMPUTE, ctx.layernorm_pipe.pipe_layout,
+                            0, 1, &ds, 0, NULL);
+    vkCmdPushConstants(ctx.cmd, ctx.layernorm_pipe.pipe_layout, VK_SHADER_STAGE_COMPUTE_BIT, 0, 12, push);
+    vkCmdDispatch(ctx.cmd, n_rows, 1, 1);
+    cmd_barrier_after_dispatch();
+    cmd_submit();
+    
+    return ADAMAH_OK;
+}
+
+// ============================================
+// Unified FFN (MLP) - 2-phase fused shader
+// ============================================
+int adamah_fused_ffn(uint32_t map_id,
+                     uint32_t loc_out, uint32_t loc_x,
+                     uint32_t loc_w1, uint32_t loc_b1,
+                     uint32_t loc_w2, uint32_t loc_b2,
+                     uint32_t BT, uint32_t D, uint32_t apply_residual) {
+    if (map_id >= MAX_MAPS || !ctx.maps[map_id].active) return ADAMAH_ERR_INVALID;
+    if (!ctx.unified_pipe.pipeline && init_pipelines() != 0) return ADAMAH_ERR_VULKAN;
+    if (!ctx.unified_pipe.pipeline) return ADAMAH_ERR_INVALID;
+
+    Map* m = &ctx.maps[map_id];
+    uint32_t D4 = D * 4;
+
+    GpuBuf* h_buf = get_or_create_buf("_ffn_h", BT * D4, 4);
+    if (!h_buf) return ADAMAH_ERR_MEMORY;
+
+    VkDescriptorSet ds = alloc_desc_set(&ctx.unified_pipe);
+    if (ds == VK_NULL_HANDLE) return ADAMAH_ERR_VULKAN;
+
+    VkDeviceSize x_bytes = (VkDeviceSize)BT * D * 4;
+    VkDeviceSize w1_bytes = (VkDeviceSize)D * D4 * 4;
+    VkDeviceSize b1_bytes = (VkDeviceSize)D4 * 4;
+    VkDeviceSize w2_bytes = (VkDeviceSize)D4 * D * 4;
+    VkDeviceSize b2_bytes = (VkDeviceSize)D * 4;
+    VkDeviceSize y_bytes = (VkDeviceSize)BT * D * 4;
+    VkDeviceSize h_bytes = (VkDeviceSize)BT * D4 * 4;
+
+    VkDescriptorBufferInfo buf_infos[7] = {
+        { .buffer = m->buf, .offset = (VkDeviceSize)loc_x * 4, .range = x_bytes },
+        { .buffer = m->buf, .offset = (VkDeviceSize)loc_w1 * 4, .range = w1_bytes },
+        { .buffer = m->buf, .offset = (VkDeviceSize)loc_b1 * 4, .range = b1_bytes },
+        { .buffer = m->buf, .offset = (VkDeviceSize)loc_w2 * 4, .range = w2_bytes },
+        { .buffer = m->buf, .offset = (VkDeviceSize)loc_b2 * 4, .range = b2_bytes },
+        { .buffer = m->buf, .offset = (VkDeviceSize)loc_out * 4, .range = y_bytes },
+        { .buffer = h_buf->buf, .offset = 0, .range = h_bytes }
+    };
+    VkWriteDescriptorSet writes[7];
+    for (int i = 0; i < 7; i++) {
+        writes[i] = (VkWriteDescriptorSet){ .sType = VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET,
+            .dstSet = ds, .dstBinding = i, .descriptorCount = 1,
+            .descriptorType = VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, .pBufferInfo = &buf_infos[i] };
+    }
+    vkUpdateDescriptorSets(ctx.device, 7, writes, 0, NULL);
+
+    uint32_t push_phase0[5] = { BT, D, D4, apply_residual, 0 };
+    uint32_t push_phase1[5] = { BT, D, D4, apply_residual, 1 };
+
+    uint32_t gx_h = (D4 + 15) / 16;
+    uint32_t gy_h = (BT + 15) / 16;
+    uint32_t gx_y = (D + 15) / 16;
+    uint32_t gy_y = gy_h;
+
+    cmd_begin();
+    vkCmdBindPipeline(ctx.cmd, VK_PIPELINE_BIND_POINT_COMPUTE, ctx.unified_pipe.pipeline);
+    vkCmdBindDescriptorSets(ctx.cmd, VK_PIPELINE_BIND_POINT_COMPUTE, ctx.unified_pipe.pipe_layout,
+                            0, 1, &ds, 0, NULL);
+
+    // Phase 0: H = GELU(X*W1 + b1)
+    vkCmdPushConstants(ctx.cmd, ctx.unified_pipe.pipe_layout, VK_SHADER_STAGE_COMPUTE_BIT, 0, 20, push_phase0);
+    vkCmdDispatch(ctx.cmd, gx_h, gy_h, 1);
+
+    // Barrier between phases
+    VkMemoryBarrier mb = { .sType = VK_STRUCTURE_TYPE_MEMORY_BARRIER,
+        .srcAccessMask = VK_ACCESS_SHADER_WRITE_BIT,
+        .dstAccessMask = VK_ACCESS_SHADER_READ_BIT };
+    vkCmdPipelineBarrier(ctx.cmd,
+        VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT,
+        VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT,
+        0, 1, &mb, 0, NULL, 0, NULL);
+
+    // Phase 1: Y = H*W2 + b2 (+ residual)
+    vkCmdPushConstants(ctx.cmd, ctx.unified_pipe.pipe_layout, VK_SHADER_STAGE_COMPUTE_BIT, 0, 20, push_phase1);
+    vkCmdDispatch(ctx.cmd, gx_y, gy_y, 1);
+    cmd_submit();
+
     return ADAMAH_OK;
 }
