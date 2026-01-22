@@ -4,7 +4,7 @@
 
 Zero-CUDA alternative using Vulkan. Supports transformers, embeddings, and neural network operations.
 
-## Quick Install
+## Quick Install (Legacy)
 
 ```bash
 # One-liner install from GitHub
