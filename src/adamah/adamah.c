@@ -1,5 +1,5 @@
 /*
- * ADAMAH v4.0 - Map-Centric GPU Compute
+ * ADAMAH v4.3.0 - Map-Centric GPU Compute
  * 
  * Pure GPU operations on Memory Maps
  * scatter/gather for CPU I/O
