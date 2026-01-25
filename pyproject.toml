@@ -1,0 +1,36 @@
+[build-system]
+requires = ["setuptools>=68", "wheel"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "adamah"
+version = "5.0.0"
+description = "Map-centric GPU compute library"
+readme = "README.md"
+requires-python = ">=3.8"
+license = {text = "CC-BY-NC-4.0"}
+authors = [{name = "Samuele Scuglia"}]
+keywords = ["gpu", "vulkan", "compute", "ai", "ml", "transformer"]
+classifiers = [
+  "Development Status :: 4 - Beta",
+  "Intended Audience :: Developers",
+  "Intended Audience :: Science/Research",
+  "Topic :: Scientific/Engineering :: Artificial Intelligence",
+  "Programming Language :: Python :: 3",
+  "Programming Language :: C",
+  "Operating System :: POSIX :: Linux",
+]
+dependencies = ["numpy"]
+
+[project.urls]
+Homepage = "https://github.com/krokodil-byte/ADAMAH"
+
+[tool.setuptools]
+package-dir = {"" = "src"}
+include-package-data = true
+
+[tool.setuptools.packages.find]
+where = ["src"]
+
+[tool.setuptools.package-data]
+"adamah" = ["*.c", "*.h", "shaders/*.spv", "shaders/*.comp"]

@@ -1,10 +1,9 @@
-# ADAMAH v4.3.0
+# ADAMAH v5.0.0
 
-**Vulkan to FFI GPU Compute Library*
+Map-centric GPU compute library (Vulkan) for AI/ML workloads.
+Zero-CUDA alternative with cached locations, batching, and map-oriented ops.
 
-Zero-CUDA alternative using Vulkan. Supports transformers, embeddings, and neural network operations.
-
-## Quick Install (Legacy)
+## Quick Install
 
 ```bash
 # One-liner install from GitHub
@@ -14,85 +13,109 @@ pip install git+https://github.com/krokodil-byte/ADAMAH.git
 sudo apt install libvulkan-dev build-essential  # Ubuntu/Debian
 ```
 
-## Features
-
-- **Matrix Multiplication**: `map_matmul()` - batched matmul on GPU
-- **Reduce Operations**: `map_reduce_sum/max/min()` - for softmax, layernorm
-- **Broadcast**: `map_scale()` - scalar-vector operations
-- **Element-wise**: `map_sin/cos/exp/tanh/relu/gelu/add/mul...`
-- **Scatter/Gather**: Sparse access patterns for embeddings
-
-## Quick Start
+## Quick Start (Python, recommended)
 
 ```python
-import adamah
 import numpy as np
+import adamah
 
-gpu = adamah.Adamah()
+gpu = adamah.init(cache_mb=512)  # optional cache
+u = gpu.uucis
 
-# Create GPU memory map
-gpu.map_init(0, word_size=4, pack_size=768, n_packs=50000)  # 50k embeddings
+# 1D map (array) with 1024 float32 elements
+u.array_init(map_id=0, n_cells=1024, wordlength=4)
+locs = np.arange(1024, dtype=np.uint32)
+locs_c = u.cache_locs(0, locs)
 
-# Load data (CPU → GPU)
-embeddings = np.random.randn(50000, 768).astype(np.float32)
-gpu.scatter(0, np.arange(50000, dtype=np.uint32), embeddings.flatten())
+x = np.random.randn(1024).astype(np.float32)
 
-# GPU operations
-locs = np.array([0, 1, 2], dtype=np.uint32)
-gpu.map_op1(0, adamah.OP_GELU, locs, locs)  # GELU activation
+# CPU -> GPU
+u.scatter(0, locs_c, x)
 
-# Read back (GPU → CPU)
-result = gpu.gather(0, locs)
+# Unary op: exp(x)
+u.mop1("EXP", map_id=0, target=0, locs_src=locs_c, locs_dst=locs_c)
+
+# GPU -> CPU
+out = u.gather(0, locs_c)
 
 gpu.shutdown()
 ```
 
-## Matrix Multiplication
+## Features (Python API)
+
+- UUCIS wrapper with cached locs and device-only ops
+- Unary, binary, reduce, broadcast, softmax, layernorm, matmul
+- Scatter/gather for sparse map access
+- Auto-batching (with optional manual batching)
+
+## UUCIS Ops (string-based)
+
+`mop1` (unary / reduce / softmax / layernorm)
+- Unary: NEG, ABS, SQRT, EXP, LOG, TANH, RELU, GELU, SIN, COS, RECIP, SQR
+- Reduce: SUM, MAX, MIN
+- SOFTMAX, LAYERNORM
+
+`mop2` (binary / broadcast / matmul)
+- Binary: ADD, SUB, MUL, DIV, POW, MIN, MAX
+- Broadcast: ADD, SUB, MUL, DIV
+- MATMUL
+
+Examples:
 
 ```python
-# C = A @ B  (batched)
-gpu.map_matmul(map_id, locs_A, locs_B, locs_C, M, K, N)
+u.mop1("REDUCE:SUM", 0, 0, locs_src=src_c, locs_dst=dst_c)
+
+u.mop2("BROADCAST:ADD", 0, 0, 0, locs_a=src_c, locs_b=scalar_c, locs_dst=dst_c)
+
+u.mop2("MATMUL", 3, 3, 3, extra={
+    "locs_a": a_c,
+    "locs_b": b_c,
+    "locs_c": c_c,
+    "M": M, "K": K, "N": N,
+})
 ```
 
-## Softmax (using reduce + broadcast)
+## Batching and Sync
+
+- Auto-batching is enabled by default:
 
 ```python
-# softmax = exp(x - max) / sum(exp(x - max))
-gpu.map_reduce_max(0, x_locs, max_locs)      # max per row
-gpu.map_broadcast(0, BROADCAST_SUB, x_locs, max_locs, tmp_locs)  # x - max
-gpu.map_exp(0, tmp_locs, tmp_locs)           # exp
-gpu.map_reduce_sum(0, tmp_locs, sum_locs)    # sum
-gpu.map_div_scalar(0, tmp_locs, sum_locs, out_locs)  # normalize
+u.set_auto_batching(True, limit=4096)
 ```
 
-## API Reference
+- Disable auto-batching (submit each op immediately):
 
-| Function | Description |
-|----------|-------------|
-| `map_init(id, word_size, pack_size, n_packs)` | Create GPU memory map |
-| `scatter(id, locs, data)` | CPU → GPU transfer |
-| `gather(id, locs)` | GPU → CPU transfer |
-| `map_matmul(id, A, B, C, M, K, N)` | Matrix multiplication |
-| `map_reduce_sum/max/min(id, src, dst)` | Reduce along pack |
-| `map_scale(id, src, scalar, dst)` | Broadcast multiply |
-| `map_op1(id, op, src, dst)` | Unary ops (sin, exp, gelu...) |
-| `map_op2(id, op, a, b, dst)` | Binary ops (add, mul...) |
+```python
+u.set_auto_batching(False)
+```
 
-## Operations
+- Manual batching:
 
-**Unary**: NEG, ABS, SQRT, EXP, LOG, TANH, RELU, GELU, SIN, COS, RECIP, SQR
+```python
+with gpu.batch():
+    u.mop1(...)
+    u.mop2(...)
+```
 
-**Binary**: ADD, SUB, MUL, DIV, POW, MIN, MAX
+- Sync:
 
-**Reduce**: SUM, MAX, MIN
+```python
+gpu.synchronize_all()
+```
 
-**Broadcast**: MUL, DIV, ADD, SUB
+## Low-level Adamah API (optional)
 
-## Performance
+The `Adamah` object exposes direct map ops (no string parsing):
 
-- 65+ GB/s memory bandwidth on RTX 3070
-- Zero-copy GPU compute (data stays in VRAM)
-- Cross-platform via Vulkan (NVIDIA, AMD, Intel)
+- `map_init`, `scatter`, `gather`
+- `map_op1`, `map_op2`, `map_reduce`, `map_broadcast`
+- `map_softmax`, `map_layernorm`, `map_matmul`
+- `batch_begin`, `batch_end`, `synchronize_all`
+
+## Array API (status)
+
+The `gpu.array`, `gpu.add`, and `gpu.mul` methods exist but are not implemented yet.
+Use maps + UUCIS instead.
 
 ## Requirements
 
@@ -103,6 +126,6 @@ gpu.map_div_scalar(0, tmp_locs, sum_locs, out_locs)  # normalize
 
 ## License
 
-**CC BY-NC 4.0** - Free for non-commercial use with attribution.
+CC BY-NC 4.0 - Free for non-commercial use with attribution.
 
-© 2026 Samuele Scuglia
+(c) 2026 Samuele Scuglia
