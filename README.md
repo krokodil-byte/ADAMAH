@@ -1,4 +1,5 @@
-# ADAMAH 5.0
+# ADAMAH 5.0.0
+
 
 GPU compute library using Vulkan. No CUDA required.
 
