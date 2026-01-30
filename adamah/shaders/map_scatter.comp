@@ -1,0 +1,39 @@
+#version 450
+
+// GPU Scatter: data[locs[i]] = src[i] for each i
+// Much faster than many small CPU->GPU copies
+
+layout(local_size_x = 256) in;
+
+layout(push_constant) uniform PushConstants {
+    uint n_locs;      // Number of locations
+    uint pack_size;   // Elements per pack
+} pc;
+
+// Main map buffer (destination)
+layout(std430, binding = 0) buffer MapBuffer {
+    float map_data[];
+};
+
+// Source data (contiguous, n_locs * pack_size floats)
+layout(std430, binding = 1) buffer SrcBuffer {
+    float src_data[];
+};
+
+// Location indices (n_locs uints)
+layout(std430, binding = 2) buffer LocsBuffer {
+    uint locs[];
+};
+
+void main() {
+    uint tid = gl_GlobalInvocationID.x;
+    uint total = pc.n_locs * pc.pack_size;
+    
+    if (tid >= total) return;
+    
+    uint loc_idx = tid / pc.pack_size;  // Which pack
+    uint elem_idx = tid % pc.pack_size;  // Which element in pack
+    
+    uint dst_base = locs[loc_idx] * pc.pack_size;
+    map_data[dst_base + elem_idx] = src_data[tid];
+}

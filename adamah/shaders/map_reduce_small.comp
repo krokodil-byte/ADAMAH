@@ -1,0 +1,62 @@
+#version 450
+
+// Reduced workgroup size for small pack_size workloads.
+layout(local_size_x = 64) in;
+
+layout(push_constant) uniform PushConstants {
+    uint op_code;     // 0=SUM, 1=MAX, 2=MIN
+    uint n_locs;      // Number of packs to reduce
+    uint pack_size;   // Elements per pack (reduce dimension)
+} pc;
+
+layout(std430, binding = 0) buffer MapBuffer {
+    float data[];
+};
+
+layout(std430, binding = 1) buffer SrcLocs {
+    uint locs_src[];
+};
+
+layout(std430, binding = 2) buffer DstLocs {
+    uint locs_dst[];
+};
+
+shared float sdata[64];
+
+void main() {
+    uint tid = gl_LocalInvocationID.x;
+    uint loc_idx = gl_WorkGroupID.x;
+
+    if (loc_idx >= pc.n_locs) return;
+
+    uint src_base = locs_src[loc_idx] * pc.pack_size;
+    uint dst_base = locs_dst[loc_idx];
+
+    float val;
+    if (pc.op_code == 0) val = 0.0;
+    else if (pc.op_code == 1) val = -1e38;
+    else val = 1e38;
+
+    for (uint i = tid; i < pc.pack_size; i += 64) {
+        float x = data[src_base + i];
+        if (pc.op_code == 0) val += x;
+        else if (pc.op_code == 1) val = max(val, x);
+        else val = min(val, x);
+    }
+
+    sdata[tid] = val;
+    barrier();
+
+    for (uint s = 32; s > 0; s >>= 1) {
+        if (tid < s) {
+            if (pc.op_code == 0) sdata[tid] += sdata[tid + s];
+            else if (pc.op_code == 1) sdata[tid] = max(sdata[tid], sdata[tid + s]);
+            else sdata[tid] = min(sdata[tid], sdata[tid + s]);
+        }
+        barrier();
+    }
+
+    if (tid == 0) {
+        data[dst_base] = sdata[0];
+    }
+}

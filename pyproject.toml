@@ -26,11 +26,10 @@ dependencies = ["numpy"]
 Homepage = "https://github.com/krokodil-byte/ADAMAH"
 
 [tool.setuptools]
-package-dir = {"" = "src"}
 include-package-data = true
 
 [tool.setuptools.packages.find]
-where = ["src"]
+where = ["."]
 
 [tool.setuptools.package-data]
-"adamah" = ["*.c", "*.h", "shaders/*.spv", "shaders/*.comp"]
+"adamah" = ["*.so", "*.c", "shaders/*.spv", "shaders/*.comp"]

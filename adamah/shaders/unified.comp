@@ -1,0 +1,104 @@
+#version 450
+
+layout(local_size_x = 16, local_size_y = 16) in;
+
+layout(push_constant) uniform PushConstants {
+    uint BT;
+    uint D;
+    uint D4;
+    uint apply_residual;
+    uint phase;
+} pc;
+
+// Inputs/weights/outputs
+layout(std430, binding = 0) buffer XBuf  { float X[];  };
+layout(std430, binding = 1) buffer W1Buf { float W1[]; };
+layout(std430, binding = 2) buffer B1Buf { float B1[]; };
+layout(std430, binding = 3) buffer W2Buf { float W2[]; };
+layout(std430, binding = 4) buffer B2Buf { float B2[]; };
+layout(std430, binding = 5) buffer YBuf  { float Y[];  };
+layout(std430, binding = 6) buffer HBuf  { float H[];  }; // temporary H = GELU(X*W1 + B1)
+
+shared float x_tile[16][16];
+shared float w_tile[16][16];
+
+float gelu_approx(float x) {
+    float x3 = x * x * x;
+    float t = 0.7978845608 * (x + 0.044715 * x3);
+    return 0.5 * x * (1.0 + tanh(t));
+}
+
+void main() {
+    uint gx = gl_GlobalInvocationID.x;
+    uint gy = gl_GlobalInvocationID.y;
+
+    if (pc.phase == 0u) {
+        // Phase 0: compute H [BT, D4]
+        uint k = gx;
+        uint bt = gy;
+        if (bt >= pc.BT || k >= pc.D4) return;
+
+        float acc = 0.0;
+        uint tiles = (pc.D + 15u) / 16u;
+        for (uint t = 0u; t < tiles; t++) {
+            uint k_in = t * 16u + gl_LocalInvocationID.x;
+            uint w_in = t * 16u + gl_LocalInvocationID.y;
+
+            if (k_in < pc.D) {
+                x_tile[gl_LocalInvocationID.y][gl_LocalInvocationID.x] = X[bt * pc.D + k_in];
+            } else {
+                x_tile[gl_LocalInvocationID.y][gl_LocalInvocationID.x] = 0.0;
+            }
+
+            if (w_in < pc.D) {
+                w_tile[gl_LocalInvocationID.y][gl_LocalInvocationID.x] = W1[w_in * pc.D4 + k];
+            } else {
+                w_tile[gl_LocalInvocationID.y][gl_LocalInvocationID.x] = 0.0;
+            }
+
+            barrier();
+            for (uint i = 0u; i < 16u; i++) {
+                acc += x_tile[gl_LocalInvocationID.y][i] * w_tile[i][gl_LocalInvocationID.x];
+            }
+            barrier();
+        }
+        acc += B1[k];
+        H[bt * pc.D4 + k] = gelu_approx(acc);
+        return;
+    }
+
+    // Phase 1: compute Y [BT, D]
+    uint d = gx;
+    uint bt = gy;
+    if (bt >= pc.BT || d >= pc.D) return;
+
+    float sum = 0.0;
+    uint tiles = (pc.D4 + 15u) / 16u;
+    for (uint t = 0u; t < tiles; t++) {
+        uint k_in = t * 16u + gl_LocalInvocationID.x;
+        uint w_in = t * 16u + gl_LocalInvocationID.y;
+
+        if (k_in < pc.D4) {
+            x_tile[gl_LocalInvocationID.y][gl_LocalInvocationID.x] = H[bt * pc.D4 + k_in];
+        } else {
+            x_tile[gl_LocalInvocationID.y][gl_LocalInvocationID.x] = 0.0;
+        }
+
+        if (w_in < pc.D4) {
+            w_tile[gl_LocalInvocationID.y][gl_LocalInvocationID.x] = W2[w_in * pc.D + d];
+        } else {
+            w_tile[gl_LocalInvocationID.y][gl_LocalInvocationID.x] = 0.0;
+        }
+
+        barrier();
+        for (uint i = 0u; i < 16u; i++) {
+            sum += x_tile[gl_LocalInvocationID.y][i] * w_tile[i][gl_LocalInvocationID.x];
+        }
+        barrier();
+    }
+    sum += B2[d];
+    if (pc.apply_residual != 0u) {
+        sum += X[bt * pc.D + d];
+    }
+    Y[bt * pc.D + d] = sum;
+}

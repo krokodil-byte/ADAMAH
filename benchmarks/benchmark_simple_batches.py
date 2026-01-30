@@ -13,6 +13,15 @@ except Exception as exc:
     _CUPY_AVAILABLE = False
     _CUPY_IMPORT_ERROR = str(exc)
 
+try:
+    import torch
+    _TORCH_AVAILABLE = torch.cuda.is_available()
+    _TORCH_IMPORT_ERROR = "" if _TORCH_AVAILABLE else "CUDA not available"
+except Exception as exc:
+    torch = None
+    _TORCH_AVAILABLE = False
+    _TORCH_IMPORT_ERROR = str(exc)
+
 
 HERE = os.path.dirname(os.path.abspath(__file__))
 ROOT = os.path.abspath(os.path.join(HERE, ".."))
@@ -91,23 +100,36 @@ def summarize_results(results):
         key = (row["section"], row["label"], row["n_ops"])
         groups.setdefault(key, {})[row["backend"]] = row
 
-    print("\nSummary (ms/op)  speedup = cupy/adamah ( >1 means Adamah faster )")
+    print("\n" + "=" * 105)
+    print("SUMMARY (ms/op)  speedup = other/adamah ( >1 means Adamah faster )")
+    print("=" * 105)
     for section in sorted({r["section"] for r in results}):
         print(f"\n{section}")
-        print("op                           n_ops     adamah     cupy   speedup")
+        print(f"{'op':<28} {'n_ops':>7}  {'adamah':>10}  {'pytorch':>10}  {'cupy':>10}  {'vs torch':>10}  {'vs cupy':>10}")
+        print("-" * 105)
         for (sec, label, n_ops), backends in sorted(groups.items(), key=lambda x: (x[0][0], x[0][1], x[0][2])):
             if sec != section:
                 continue
             a = backends.get("adamah")
+            t = backends.get("pytorch")
             c = backends.get("cupy")
             a_ms = f"{a['per_op_ms']:.6f}" if a else "n/a"
+            t_ms = f"{t['per_op_ms']:.6f}" if t else "n/a"
             c_ms = f"{c['per_op_ms']:.6f}" if c else "n/a"
-            if a and c and a["per_op_ms"] > 0:
-                speed = c["per_op_ms"] / a["per_op_ms"]
-                speed_s = f"{speed:7.2f}x"
+            
+            if a and t and a["per_op_ms"] > 0:
+                speed_t = t["per_op_ms"] / a["per_op_ms"]
+                speed_t_s = f"{speed_t:7.2f}x"
             else:
-                speed_s = "   n/a "
-            print(f"{label:28s} {n_ops:7d}  {a_ms:>8}  {c_ms:>8}  {speed_s}")
+                speed_t_s = "   n/a   "
+            
+            if a and c and a["per_op_ms"] > 0:
+                speed_c = c["per_op_ms"] / a["per_op_ms"]
+                speed_c_s = f"{speed_c:7.2f}x"
+            else:
+                speed_c_s = "   n/a   "
+            
+            print(f"{label:<28} {n_ops:>7}  {a_ms:>10}  {t_ms:>10}  {c_ms:>10}  {speed_t_s:>10}  {speed_c_s:>10}")
 
 
 def main():
@@ -530,193 +552,383 @@ def main():
     # ------------------------------------------------------------
     # CuPy benchmarks (same ops)
     # ------------------------------------------------------------
+    # CuPy benchmarks
     if not _CUPY_AVAILABLE:
         print(f"\nCuPy not available, skipping CuPy benchmarks: {_CUPY_IMPORT_ERROR}")
-        summarize_results(results)
-        return
-
-    cp.cuda.get_current_stream().synchronize()
-    cp_a = cp.asarray(data_a)
-    cp_b = cp.asarray(data_b)
-    cp_out = cp.asarray(data_tmp)
-    cp_tmp = cp.asarray(data_tmp)
-    cp_scalar = cp.asarray(np.array([1.2345], dtype=np.float32))
-
-    cp_perm = cp.asarray(perm)
-    cp_a_perm = cp.take(cp_a, cp_perm)
-    cp_b_perm = cp.take(cp_b, cp_perm)
-    cp_out_perm = cp.empty_like(cp_a_perm)
-    cp_tmp_perm = cp.empty_like(cp_a_perm)
-
-    cp_soft_src = cp.asarray(soft_src).reshape(N_ROWS, ROW_SIZE)
-    cp_soft_dst = cp.asarray(soft_dst).reshape(N_ROWS, ROW_SIZE)
-
-    cp_ln_src = cp.asarray(ln_src).reshape(N_ROWS, ROW_SIZE)
-    cp_ln_gamma = cp.asarray(ln_gamma).reshape(N_ROWS, ROW_SIZE)
-    cp_ln_beta = cp.asarray(ln_beta).reshape(N_ROWS, ROW_SIZE)
-    cp_ln_dst = cp.empty_like(cp_ln_src)
-
-    cp_mm_a = cp.asarray(mm_a).reshape(M, K)
-    cp_mm_b = cp.asarray(mm_b).reshape(K, N)
-    cp_mm_c = cp.empty((M, N), dtype=cp_mm_a.dtype)
-
-    cp_indices = cp.asarray(locs_a)
-    cp_scatter_data = cp.asarray(rng.standard_normal(VEC_SIZE, dtype=np.float32))
-    cp_scale = cp.asarray(t_scale)
-
-    cp_t_x = cp.asarray(t_x_data).reshape(t_seq, t_d)
-    cp_t_wqk = cp.asarray(t_wqk_data).reshape(t_d, t_seq)
-    cp_t_wv = cp.asarray(t_wv_data).reshape(t_d, t_d)
-    cp_t_wo = cp.asarray(t_wo_data).reshape(t_d, t_d)
-    cp_t_scores = cp.empty((t_seq, t_seq), dtype=cp_t_x.dtype)
-    cp_t_scores_soft = cp.empty_like(cp_t_scores)
-    cp_t_v = cp.empty_like(cp_t_x)
-    cp_t_attn = cp.empty_like(cp_t_x)
-    cp_t_out = cp.empty_like(cp_t_x)
-    cp_t_resid = cp.empty_like(cp_t_x)
-    cp_t_ln = cp.empty_like(cp_t_x)
-    cp_t_gamma = cp.asarray(t_gamma).reshape(1, t_d)
-    cp_t_beta = cp.asarray(t_beta).reshape(1, t_d)
-
-    def cupy_sync():
+    else:
         cp.cuda.get_current_stream().synchronize()
+        cp_a = cp.asarray(data_a)
+        cp_b = cp.asarray(data_b)
+        cp_out = cp.asarray(data_tmp)
+        cp_tmp = cp.asarray(data_tmp)
+        cp_scalar = cp.asarray(np.array([1.2345], dtype=np.float32))
 
-    print("\nElementwise / Binary / Broadcast (cached locs) [CuPy]")
-    print("op                           n_ops     total_ms     ms/op")
-    for n_ops in BATCH_SIZES:
-        bench_batch("Unary EXP (contig)", lambda: cp.exp(cp_a, out=cp_out),
-                    n_ops, use_batch=False, backend="cupy",
-                    section="Elementwise / Binary / Broadcast", results=results, sync_fn=cupy_sync)
-        if n_ops <= 1_000:
-            bench_batch("Unary EXP (perm)", lambda: cp.exp(cp_a_perm, out=cp_out_perm),
+        cp_perm = cp.asarray(perm)
+        cp_a_perm = cp.take(cp_a, cp_perm)
+        cp_b_perm = cp.take(cp_b, cp_perm)
+        cp_out_perm = cp.empty_like(cp_a_perm)
+        cp_tmp_perm = cp.empty_like(cp_a_perm)
+
+        cp_soft_src = cp.asarray(soft_src).reshape(N_ROWS, ROW_SIZE)
+        cp_soft_dst = cp.asarray(soft_dst).reshape(N_ROWS, ROW_SIZE)
+
+        cp_ln_src = cp.asarray(ln_src).reshape(N_ROWS, ROW_SIZE)
+        cp_ln_gamma = cp.asarray(ln_gamma).reshape(N_ROWS, ROW_SIZE)
+        cp_ln_beta = cp.asarray(ln_beta).reshape(N_ROWS, ROW_SIZE)
+        cp_ln_dst = cp.empty_like(cp_ln_src)
+
+        cp_mm_a = cp.asarray(mm_a).reshape(M, K)
+        cp_mm_b = cp.asarray(mm_b).reshape(K, N)
+        cp_mm_c = cp.empty((M, N), dtype=cp_mm_a.dtype)
+
+        cp_indices = cp.asarray(locs_a)
+        cp_scatter_data = cp.asarray(rng.standard_normal(VEC_SIZE, dtype=np.float32))
+        cp_scale = cp.asarray(t_scale)
+
+        cp_t_x = cp.asarray(t_x_data).reshape(t_seq, t_d)
+        cp_t_wqk = cp.asarray(t_wqk_data).reshape(t_d, t_seq)
+        cp_t_wv = cp.asarray(t_wv_data).reshape(t_d, t_d)
+        cp_t_wo = cp.asarray(t_wo_data).reshape(t_d, t_d)
+        cp_t_scores = cp.empty((t_seq, t_seq), dtype=cp_t_x.dtype)
+        cp_t_scores_soft = cp.empty_like(cp_t_scores)
+        cp_t_v = cp.empty_like(cp_t_x)
+        cp_t_attn = cp.empty_like(cp_t_x)
+        cp_t_out = cp.empty_like(cp_t_x)
+        cp_t_resid = cp.empty_like(cp_t_x)
+        cp_t_ln = cp.empty_like(cp_t_x)
+        cp_t_gamma = cp.asarray(t_gamma).reshape(1, t_d)
+        cp_t_beta = cp.asarray(t_beta).reshape(1, t_d)
+
+        def cupy_sync():
+            cp.cuda.get_current_stream().synchronize()
+
+        print("\nElementwise / Binary / Broadcast (cached locs) [CuPy]")
+        print("op                           n_ops     total_ms     ms/op")
+        for n_ops in BATCH_SIZES:
+            bench_batch("Unary EXP (contig)", lambda: cp.exp(cp_a, out=cp_out),
                         n_ops, use_batch=False, backend="cupy",
                         section="Elementwise / Binary / Broadcast", results=results, sync_fn=cupy_sync)
-        bench_batch("Binary ADD (contig)", lambda: cp.add(cp_a, cp_b, out=cp_out),
-                    n_ops, use_batch=False, backend="cupy",
-                    section="Elementwise / Binary / Broadcast", results=results, sync_fn=cupy_sync)
-        bench_batch("Broadcast ADD (contig)", lambda: cp.add(cp_a, cp_scalar, out=cp_out),
-                    n_ops, use_batch=False, backend="cupy",
-                    section="Elementwise / Binary / Broadcast", results=results, sync_fn=cupy_sync)
-        bench_batch("Reduce SUM (contig)", lambda: cp.copyto(cp_out, cp_a),
-                    n_ops, use_batch=False, backend="cupy",
-                    section="Elementwise / Binary / Broadcast", results=results, sync_fn=cupy_sync)
-        print("-" * 72)
+            if n_ops <= 1_000:
+                bench_batch("Unary EXP (perm)", lambda: cp.exp(cp_a_perm, out=cp_out_perm),
+                            n_ops, use_batch=False, backend="cupy",
+                            section="Elementwise / Binary / Broadcast", results=results, sync_fn=cupy_sync)
+            bench_batch("Binary ADD (contig)", lambda: cp.add(cp_a, cp_b, out=cp_out),
+                        n_ops, use_batch=False, backend="cupy",
+                        section="Elementwise / Binary / Broadcast", results=results, sync_fn=cupy_sync)
+            bench_batch("Broadcast ADD (contig)", lambda: cp.add(cp_a, cp_scalar, out=cp_out),
+                        n_ops, use_batch=False, backend="cupy",
+                        section="Elementwise / Binary / Broadcast", results=results, sync_fn=cupy_sync)
+            bench_batch("Reduce SUM (contig)", lambda: cp.copyto(cp_out, cp_a),
+                        n_ops, use_batch=False, backend="cupy",
+                        section="Elementwise / Binary / Broadcast", results=results, sync_fn=cupy_sync)
+            print("-" * 72)
 
-    print("\nChained / Mixed batches [CuPy]")
-    print("op                           n_ops     total_ms     ms/op")
-    for n_ops in BATCH_SIZES:
-        def chain_same_c():
-            cp.exp(cp_a, out=cp_out)
-            cp.exp(cp_out, out=cp_tmp)
-            cp.exp(cp_tmp, out=cp_out)
-        bench_batch("Chain 3x EXP", chain_same_c, n_ops, use_batch=False, ops_per_iter=3,
-                    backend="cupy", section="Chained / Mixed batches", results=results, sync_fn=cupy_sync)
+        print("\nChained / Mixed batches [CuPy]")
+        print("op                           n_ops     total_ms     ms/op")
+        for n_ops in BATCH_SIZES:
+            def chain_same_c():
+                cp.exp(cp_a, out=cp_out)
+                cp.exp(cp_out, out=cp_tmp)
+                cp.exp(cp_tmp, out=cp_out)
+            bench_batch("Chain 3x EXP", chain_same_c, n_ops, use_batch=False, ops_per_iter=3,
+                        backend="cupy", section="Chained / Mixed batches", results=results, sync_fn=cupy_sync)
 
-        def mixed_c():
-            cp.exp(cp_a, out=cp_out)
-            cp.add(cp_out, cp_b, out=cp_tmp)
-            cp.add(cp_tmp, cp_scalar, out=cp_out)
-        bench_batch("Mixed 3-op", mixed_c, n_ops, use_batch=False, ops_per_iter=3,
-                    backend="cupy", section="Chained / Mixed batches", results=results, sync_fn=cupy_sync)
-        print("-" * 72)
+            def mixed_c():
+                cp.exp(cp_a, out=cp_out)
+                cp.add(cp_out, cp_b, out=cp_tmp)
+                cp.add(cp_tmp, cp_scalar, out=cp_out)
+            bench_batch("Mixed 3-op", mixed_c, n_ops, use_batch=False, ops_per_iter=3,
+                        backend="cupy", section="Chained / Mixed batches", results=results, sync_fn=cupy_sync)
+            print("-" * 72)
 
-    print("\nSoftmax / LayerNorm / MatMul (smaller batches) [CuPy]")
-    print("op                           n_ops     total_ms     ms/op")
-    for n_ops in HEAVY_BATCH_SIZES:
-        def softmax_c():
-            maxv = cp.max(cp_soft_src, axis=1, keepdims=True)
-            expv = cp.exp(cp_soft_src - maxv)
-            cp_soft_dst[:] = expv / cp.sum(expv, axis=1, keepdims=True)
-        bench_batch("Softmax", softmax_c, n_ops, use_batch=False,
-                    backend="cupy", section="Softmax / LayerNorm / MatMul", results=results, sync_fn=cupy_sync)
+        print("\nSoftmax / LayerNorm / MatMul (smaller batches) [CuPy]")
+        print("op                           n_ops     total_ms     ms/op")
+        for n_ops in HEAVY_BATCH_SIZES:
+            def softmax_c():
+                maxv = cp.max(cp_soft_src, axis=1, keepdims=True)
+                expv = cp.exp(cp_soft_src - maxv)
+                cp_soft_dst[:] = expv / cp.sum(expv, axis=1, keepdims=True)
+            bench_batch("Softmax", softmax_c, n_ops, use_batch=False,
+                        backend="cupy", section="Softmax / LayerNorm / MatMul", results=results, sync_fn=cupy_sync)
 
-        def layernorm_c():
-            mean = cp.mean(cp_ln_src, axis=1, keepdims=True)
-            var = cp.var(cp_ln_src, axis=1, keepdims=True)
-            cp_ln_dst[:] = (cp_ln_src - mean) / cp.sqrt(var + 1e-5)
-            cp_ln_dst[:] = cp_ln_dst * cp_ln_gamma + cp_ln_beta
-        bench_batch("LayerNorm", layernorm_c, n_ops, use_batch=False,
-                    backend="cupy", section="Softmax / LayerNorm / MatMul", results=results, sync_fn=cupy_sync)
+            def layernorm_c():
+                mean = cp.mean(cp_ln_src, axis=1, keepdims=True)
+                var = cp.var(cp_ln_src, axis=1, keepdims=True)
+                cp_ln_dst[:] = (cp_ln_src - mean) / cp.sqrt(var + 1e-5)
+                cp_ln_dst[:] = cp_ln_dst * cp_ln_gamma + cp_ln_beta
+            bench_batch("LayerNorm", layernorm_c, n_ops, use_batch=False,
+                        backend="cupy", section="Softmax / LayerNorm / MatMul", results=results, sync_fn=cupy_sync)
 
-        t0 = now_ms()
-        for _ in range(n_ops):
-            cp.matmul(cp_mm_a, cp_mm_b, out=cp_mm_c)
-        cupy_sync()
-        t1 = now_ms()
-        total = t1 - t0
-        per_op = total / n_ops
-        print(f"MatMul                    {n_ops:7d}  {total:10.3f} ms  {per_op:10.6f} ms/op")
-        results.append({
-            "section": "Softmax / LayerNorm / MatMul",
-            "label": "MatMul",
-            "n_ops": n_ops,
-            "backend": "cupy",
-            "total_ms": total,
-            "per_op_ms": per_op,
-        })
-        print("-" * 72)
+            t0 = now_ms()
+            for _ in range(n_ops):
+                cp.matmul(cp_mm_a, cp_mm_b, out=cp_mm_c)
+            cupy_sync()
+            t1 = now_ms()
+            total = t1 - t0
+            per_op = total / n_ops
+            print(f"MatMul                    {n_ops:7d}  {total:10.3f} ms  {per_op:10.6f} ms/op")
+            results.append({
+                "section": "Softmax / LayerNorm / MatMul",
+                "label": "MatMul",
+                "n_ops": n_ops,
+                "backend": "cupy",
+                "total_ms": total,
+                "per_op_ms": per_op,
+            })
+            print("-" * 72)
 
-    print("\nScatter / Gather (cached locs, smaller batches) [CuPy]")
-    print("op                           n_ops     total_ms     ms/op")
-    for n_ops in HEAVY_BATCH_SIZES:
-        t0 = now_ms()
-        for _ in range(n_ops):
-            cp_out[cp_indices] = cp_scatter_data
-        cupy_sync()
-        t1 = now_ms()
-        total = t1 - t0
-        per_op = total / n_ops
-        print(f"Scatter (dev)             {n_ops:7d}  {total:10.3f} ms  {per_op:10.6f} ms/op")
-        results.append({
-            "section": "Scatter / Gather",
-            "label": "Scatter (dev)",
-            "n_ops": n_ops,
-            "backend": "cupy",
-            "total_ms": total,
-            "per_op_ms": per_op,
-        })
+        print("\nScatter / Gather (cached locs, smaller batches) [CuPy]")
+        print("op                           n_ops     total_ms     ms/op")
+        for n_ops in HEAVY_BATCH_SIZES:
+            t0 = now_ms()
+            for _ in range(n_ops):
+                cp_out[cp_indices] = cp_scatter_data
+            cupy_sync()
+            t1 = now_ms()
+            total = t1 - t0
+            per_op = total / n_ops
+            print(f"Scatter (dev)             {n_ops:7d}  {total:10.3f} ms  {per_op:10.6f} ms/op")
+            results.append({
+                "section": "Scatter / Gather",
+                "label": "Scatter (dev)",
+                "n_ops": n_ops,
+                "backend": "cupy",
+                "total_ms": total,
+                "per_op_ms": per_op,
+            })
 
-        t0 = now_ms()
-        for _ in range(n_ops):
-            _ = cp_out[cp_indices]
-        cupy_sync()
-        t1 = now_ms()
-        total = t1 - t0
-        per_op = total / n_ops
-        print(f"Gather (dev)              {n_ops:7d}  {total:10.3f} ms  {per_op:10.6f} ms/op")
-        results.append({
-            "section": "Scatter / Gather",
-            "label": "Gather (dev)",
-            "n_ops": n_ops,
-            "backend": "cupy",
-            "total_ms": total,
-            "per_op_ms": per_op,
-        })
-        print("-" * 72)
+            t0 = now_ms()
+            for _ in range(n_ops):
+                _ = cp_out[cp_indices]
+            cupy_sync()
+            t1 = now_ms()
+            total = t1 - t0
+            per_op = total / n_ops
+            print(f"Gather (dev)              {n_ops:7d}  {total:10.3f} ms  {per_op:10.6f} ms/op")
+            results.append({
+                "section": "Scatter / Gather",
+                "label": "Gather (dev)",
+                "n_ops": n_ops,
+                "backend": "cupy",
+                "total_ms": total,
+                "per_op_ms": per_op,
+            })
+            print("-" * 72)
 
-    print("\nTransformer block (toy attention) [CuPy]")
-    print("op                           n_ops     total_ms     ms/op")
-    def transformer_block_cupy():
-        cp.matmul(cp_t_x, cp_t_wqk, out=cp_t_scores)
-        cp.multiply(cp_t_scores, cp_scale, out=cp_t_scores)
-        maxv = cp.max(cp_t_scores, axis=1, keepdims=True)
-        cp.subtract(cp_t_scores, maxv, out=cp_t_scores_soft)
-        cp.exp(cp_t_scores_soft, out=cp_t_scores_soft)
-        denom = cp.sum(cp_t_scores_soft, axis=1, keepdims=True)
-        cp.divide(cp_t_scores_soft, denom, out=cp_t_scores_soft)
-        cp.matmul(cp_t_x, cp_t_wv, out=cp_t_v)
-        cp.matmul(cp_t_scores_soft, cp_t_v, out=cp_t_attn)
-        cp.matmul(cp_t_attn, cp_t_wo, out=cp_t_out)
-        cp.add(cp_t_out, cp_t_x, out=cp_t_resid)
-        mean = cp.mean(cp_t_resid, axis=1, keepdims=True)
-        var = cp.var(cp_t_resid, axis=1, keepdims=True)
-        cp_t_ln[:] = (cp_t_resid - mean) / cp.sqrt(var + 1e-5)
-        cp_t_ln[:] = cp_t_ln * cp_t_gamma + cp_t_beta
+        print("\nTransformer block (toy attention) [CuPy]")
+        print("op                           n_ops     total_ms     ms/op")
+        def transformer_block_cupy():
+            cp.matmul(cp_t_x, cp_t_wqk, out=cp_t_scores)
+            cp.multiply(cp_t_scores, cp_scale, out=cp_t_scores)
+            maxv = cp.max(cp_t_scores, axis=1, keepdims=True)
+            cp.subtract(cp_t_scores, maxv, out=cp_t_scores_soft)
+            cp.exp(cp_t_scores_soft, out=cp_t_scores_soft)
+            denom = cp.sum(cp_t_scores_soft, axis=1, keepdims=True)
+            cp.divide(cp_t_scores_soft, denom, out=cp_t_scores_soft)
+            cp.matmul(cp_t_x, cp_t_wv, out=cp_t_v)
+            cp.matmul(cp_t_scores_soft, cp_t_v, out=cp_t_attn)
+            cp.matmul(cp_t_attn, cp_t_wo, out=cp_t_out)
+            cp.add(cp_t_out, cp_t_x, out=cp_t_resid)
+            mean = cp.mean(cp_t_resid, axis=1, keepdims=True)
+            var = cp.var(cp_t_resid, axis=1, keepdims=True)
+            cp_t_ln[:] = (cp_t_resid - mean) / cp.sqrt(var + 1e-5)
+            cp_t_ln[:] = cp_t_ln * cp_t_gamma + cp_t_beta
 
-    for n_ops in TRANSFORMER_ITERS:
-        bench_batch("Transformer block", transformer_block_cupy, n_ops, use_batch=False,
-                    backend="cupy", section="Transformer block", results=results, sync_fn=cupy_sync)
-        print("-" * 72)
+        for n_ops in TRANSFORMER_ITERS:
+            bench_batch("Transformer block", transformer_block_cupy, n_ops, use_batch=False,
+                        backend="cupy", section="Transformer block", results=results, sync_fn=cupy_sync)
+            print("-" * 72)
+
+    # ============================================================
+    # PyTorch benchmarks
+    # ============================================================
+    if not _TORCH_AVAILABLE:
+        print(f"\nPyTorch CUDA not available, skipping: {_TORCH_IMPORT_ERROR}")
+    else:
+        print("\n" + "=" * 72)
+        print("PyTorch Benchmarks")
+        print("=" * 72)
+
+        device = torch.device("cuda")
+        torch.cuda.synchronize()
+
+        # Setup tensors
+        pt_a = torch.from_numpy(data_a).to(device)
+        pt_b = torch.from_numpy(data_b).to(device)
+        pt_out = torch.zeros_like(pt_a)
+        pt_tmp = torch.zeros_like(pt_a)
+        pt_scalar = torch.tensor([1.2345], dtype=torch.float32, device=device)
+
+        pt_perm = torch.from_numpy(perm.astype(np.int64)).to(device)
+        pt_a_perm = pt_a[pt_perm]
+        pt_out_perm = torch.empty_like(pt_a_perm)
+
+        pt_soft_src = torch.from_numpy(soft_src).reshape(N_ROWS, ROW_SIZE).to(device)
+        pt_soft_dst = torch.zeros_like(pt_soft_src)
+
+        pt_ln_src = torch.from_numpy(ln_src).reshape(N_ROWS, ROW_SIZE).to(device)
+        pt_ln_gamma = torch.from_numpy(ln_gamma).reshape(N_ROWS, ROW_SIZE).to(device)
+        pt_ln_beta = torch.from_numpy(ln_beta).reshape(N_ROWS, ROW_SIZE).to(device)
+        pt_ln_dst = torch.empty_like(pt_ln_src)
+
+        pt_mm_a = torch.from_numpy(mm_a).reshape(M, K).to(device)
+        pt_mm_b = torch.from_numpy(mm_b).reshape(K, N).to(device)
+        pt_mm_c = torch.empty((M, N), dtype=pt_mm_a.dtype, device=device)
+
+        pt_indices = torch.from_numpy(locs_a.astype(np.int64)).to(device)
+        pt_scatter_data = torch.from_numpy(rng.standard_normal(VEC_SIZE).astype(np.float32)).to(device)
+
+        pt_t_x = torch.from_numpy(t_x_data).reshape(t_seq, t_d).to(device)
+        pt_t_wqk = torch.from_numpy(t_wqk_data).reshape(t_d, t_seq).to(device)
+        pt_t_wv = torch.from_numpy(t_wv_data).reshape(t_d, t_d).to(device)
+        pt_t_wo = torch.from_numpy(t_wo_data).reshape(t_d, t_d).to(device)
+        pt_t_scores = torch.empty((t_seq, t_seq), dtype=pt_t_x.dtype, device=device)
+        pt_t_scores_soft = torch.empty_like(pt_t_scores)
+        pt_t_v = torch.empty_like(pt_t_x)
+        pt_t_attn = torch.empty_like(pt_t_x)
+        pt_t_out = torch.empty_like(pt_t_x)
+        pt_t_resid = torch.empty_like(pt_t_x)
+        pt_t_ln = torch.empty_like(pt_t_x)
+        pt_t_gamma = torch.from_numpy(t_gamma).reshape(1, t_d).to(device)
+        pt_t_beta = torch.from_numpy(t_beta).reshape(1, t_d).to(device)
+        pt_scale = torch.tensor(t_scale, device=device)
+
+        def torch_sync():
+            torch.cuda.synchronize()
+
+        print("\nElementwise / Binary / Broadcast [PyTorch]")
+        print("op                           n_ops     total_ms     ms/op")
+        for n_ops in BATCH_SIZES:
+            bench_batch("Unary EXP (contig)", lambda: torch.exp(pt_a, out=pt_out),
+                        n_ops, use_batch=False, backend="pytorch",
+                        section="Elementwise / Binary / Broadcast", results=results, sync_fn=torch_sync)
+            if n_ops <= 1_000:
+                bench_batch("Unary EXP (perm)", lambda: torch.exp(pt_a_perm, out=pt_out_perm),
+                            n_ops, use_batch=False, backend="pytorch",
+                            section="Elementwise / Binary / Broadcast", results=results, sync_fn=torch_sync)
+            bench_batch("Binary ADD (contig)", lambda: torch.add(pt_a, pt_b, out=pt_out),
+                        n_ops, use_batch=False, backend="pytorch",
+                        section="Elementwise / Binary / Broadcast", results=results, sync_fn=torch_sync)
+            bench_batch("Broadcast ADD (contig)", lambda: torch.add(pt_a, pt_scalar, out=pt_out),
+                        n_ops, use_batch=False, backend="pytorch",
+                        section="Elementwise / Binary / Broadcast", results=results, sync_fn=torch_sync)
+            bench_batch("Reduce SUM (contig)", lambda: pt_out.copy_(pt_a),
+                        n_ops, use_batch=False, backend="pytorch",
+                        section="Elementwise / Binary / Broadcast", results=results, sync_fn=torch_sync)
+            print("-" * 72)
+
+        print("\nChained / Mixed batches [PyTorch]")
+        print("op                           n_ops     total_ms     ms/op")
+        for n_ops in BATCH_SIZES:
+            def chain_same_pt():
+                torch.exp(pt_a, out=pt_out)
+                torch.exp(pt_out, out=pt_tmp)
+                torch.exp(pt_tmp, out=pt_out)
+            bench_batch("Chain 3x EXP", chain_same_pt, n_ops, use_batch=False, ops_per_iter=3,
+                        backend="pytorch", section="Chained / Mixed batches", results=results, sync_fn=torch_sync)
+
+            def mixed_pt():
+                torch.exp(pt_a, out=pt_out)
+                torch.add(pt_out, pt_b, out=pt_tmp)
+                torch.add(pt_tmp, pt_scalar, out=pt_out)
+            bench_batch("Mixed 3-op", mixed_pt, n_ops, use_batch=False, ops_per_iter=3,
+                        backend="pytorch", section="Chained / Mixed batches", results=results, sync_fn=torch_sync)
+            print("-" * 72)
+
+        print("\nSoftmax / LayerNorm / MatMul [PyTorch]")
+        print("op                           n_ops     total_ms     ms/op")
+        for n_ops in HEAVY_BATCH_SIZES:
+            bench_batch("Softmax", lambda: torch.softmax(pt_soft_src, dim=1, out=pt_soft_dst),
+                        n_ops, use_batch=False, backend="pytorch",
+                        section="Softmax / LayerNorm / MatMul", results=results, sync_fn=torch_sync)
+
+            def layernorm_pt():
+                mean = pt_ln_src.mean(dim=1, keepdim=True)
+                var = pt_ln_src.var(dim=1, keepdim=True, unbiased=False)
+                pt_ln_dst.copy_((pt_ln_src - mean) / torch.sqrt(var + 1e-5))
+                pt_ln_dst.mul_(pt_ln_gamma).add_(pt_ln_beta)
+            bench_batch("LayerNorm", layernorm_pt, n_ops, use_batch=False,
+                        backend="pytorch", section="Softmax / LayerNorm / MatMul", results=results, sync_fn=torch_sync)
+
+            t0 = now_ms()
+            for _ in range(n_ops):
+                torch.matmul(pt_mm_a, pt_mm_b, out=pt_mm_c)
+            torch_sync()
+            t1 = now_ms()
+            total = t1 - t0
+            per_op = total / n_ops
+            print(f"MatMul                    {n_ops:7d}  {total:10.3f} ms  {per_op:10.6f} ms/op")
+            results.append({
+                "section": "Softmax / LayerNorm / MatMul",
+                "label": "MatMul",
+                "n_ops": n_ops,
+                "backend": "pytorch",
+                "total_ms": total,
+                "per_op_ms": per_op,
+            })
+            print("-" * 72)
+
+        print("\nScatter / Gather [PyTorch]")
+        print("op                           n_ops     total_ms     ms/op")
+        for n_ops in HEAVY_BATCH_SIZES:
+            t0 = now_ms()
+            for _ in range(n_ops):
+                pt_out.scatter_(0, pt_indices, pt_scatter_data)
+            torch_sync()
+            t1 = now_ms()
+            total = t1 - t0
+            per_op = total / n_ops
+            print(f"Scatter (dev)             {n_ops:7d}  {total:10.3f} ms  {per_op:10.6f} ms/op")
+            results.append({
+                "section": "Scatter / Gather",
+                "label": "Scatter (dev)",
+                "n_ops": n_ops,
+                "backend": "pytorch",
+                "total_ms": total,
+                "per_op_ms": per_op,
+            })
+
+            t0 = now_ms()
+            for _ in range(n_ops):
+                _ = pt_out[pt_indices]
+            torch_sync()
+            t1 = now_ms()
+            total = t1 - t0
+            per_op = total / n_ops
+            print(f"Gather (dev)              {n_ops:7d}  {total:10.3f} ms  {per_op:10.6f} ms/op")
+            results.append({
+                "section": "Scatter / Gather",
+                "label": "Gather (dev)",
+                "n_ops": n_ops,
+                "backend": "pytorch",
+                "total_ms": total,
+                "per_op_ms": per_op,
+            })
+            print("-" * 72)
+
+        print("\nTransformer block [PyTorch]")
+        print("op                           n_ops     total_ms     ms/op")
+        def transformer_block_pytorch():
+            torch.matmul(pt_t_x, pt_t_wqk, out=pt_t_scores)
+            pt_t_scores.mul_(pt_scale)
+            maxv = pt_t_scores.max(dim=1, keepdim=True).values
+            pt_t_scores_soft.copy_(pt_t_scores - maxv)
+            pt_t_scores_soft.exp_()
+            denom = pt_t_scores_soft.sum(dim=1, keepdim=True)
+            pt_t_scores_soft.div_(denom)
+            torch.matmul(pt_t_x, pt_t_wv, out=pt_t_v)
+            torch.matmul(pt_t_scores_soft, pt_t_v, out=pt_t_attn)
+            torch.matmul(pt_t_attn, pt_t_wo, out=pt_t_out)
+            torch.add(pt_t_out, pt_t_x, out=pt_t_resid)
+            mean = pt_t_resid.mean(dim=1, keepdim=True)
+            var = pt_t_resid.var(dim=1, keepdim=True, unbiased=False)
+            pt_t_ln.copy_((pt_t_resid - mean) / torch.sqrt(var + 1e-5))
+            pt_t_ln.mul_(pt_t_gamma).add_(pt_t_beta)
+
+        for n_ops in TRANSFORMER_ITERS:
+            bench_batch("Transformer block", transformer_block_pytorch, n_ops, use_batch=False,
+                        backend="pytorch", section="Transformer block", results=results, sync_fn=torch_sync)
+            print("-" * 72)
 
     summarize_results(results)
 

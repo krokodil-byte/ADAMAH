@@ -1,131 +1,61 @@
-# ADAMAH v5.0.0
+# ADAMAH 5.0
 
-Map-centric GPU compute library (Vulkan) for AI/ML workloads.
-Zero-CUDA alternative with cached locations, batching, and map-oriented ops.
+GPU compute library using Vulkan. No CUDA required.
 
-## Quick Install
+## Quick Start
 
 ```bash
-# One-liner install from GitHub
-pip install git+https://github.com/krokodil-byte/ADAMAH.git
+# Install dependencies (Ubuntu/Debian)
+sudo apt install libvulkan-dev glslang-tools
 
-# Requirements: Vulkan drivers + GCC
-sudo apt install libvulkan-dev build-essential  # Ubuntu/Debian
+# Build
+./compile.sh
+
+# Install
+pip install -e .
+
+# Test
+python tests/test_all_ops.py
 ```
 
-## Quick Start (Python, recommended)
+## Usage
 
 ```python
-import numpy as np
 import adamah
+import numpy as np
 
-gpu = adamah.init(cache_mb=512)  # optional cache
-u = gpu.uucis
+gpu = adamah.Adamah()
 
-# 1D map (array) with 1024 float32 elements
-u.array_init(map_id=0, n_cells=1024, wordlength=4)
-locs = np.arange(1024, dtype=np.uint32)
-locs_c = u.cache_locs(0, locs)
+a = np.random.randn(1024, 1024).astype(np.float32)
+b = np.random.randn(1024, 1024).astype(np.float32)
 
-x = np.random.randn(1024).astype(np.float32)
+# Matrix multiply
+c = gpu.matmul(a, b)
 
-# CPU -> GPU
-u.scatter(0, locs_c, x)
-
-# Unary op: exp(x)
-u.mop1("EXP", map_id=0, target=0, locs_src=locs_c, locs_dst=locs_c)
-
-# GPU -> CPU
-out = u.gather(0, locs_c)
+# Element-wise ops
+x = gpu.relu(a)
+y = gpu.sigmoid(b)
+z = gpu.add(x, y)
 
 gpu.shutdown()
 ```
 
-## Features (Python API)
+## Operations
 
-- UUCIS wrapper with cached locs and device-only ops
-- Unary, binary, reduce, broadcast, softmax, layernorm, matmul
-- Scatter/gather for sparse map access
-- Auto-batching (with optional manual batching)
+**Unary**: neg, abs, sqrt, exp, log, tanh, relu, gelu, sigmoid, swish, mish, selu, elu, leaky_relu, softplus, sin, cos, tan, hardsigmoid, hardswish, reciprocal, square, cube, sign, ceil, floor, round
 
-## UUCIS Ops (string-based)
+**Binary**: add, sub, mul, div, pow, min, max, mod, eq, ne, lt, le, gt, ge, and, or, xor
 
-`mop1` (unary / reduce / softmax / layernorm)
-- Unary: NEG, ABS, SQRT, EXP, LOG, TANH, RELU, GELU, SIN, COS, RECIP, SQR
-- Reduce: SUM, MAX, MIN
-- SOFTMAX, LAYERNORM
+**Reduction**: sum, mean, max, min, prod
 
-`mop2` (binary / broadcast / matmul)
-- Binary: ADD, SUB, MUL, DIV, POW, MIN, MAX
-- Broadcast: ADD, SUB, MUL, DIV
-- MATMUL
-
-Examples:
-
-```python
-u.mop1("REDUCE:SUM", 0, 0, locs_src=src_c, locs_dst=dst_c)
-
-u.mop2("BROADCAST:ADD", 0, 0, 0, locs_a=src_c, locs_b=scalar_c, locs_dst=dst_c)
-
-u.mop2("MATMUL", 3, 3, 3, extra={
-    "locs_a": a_c,
-    "locs_b": b_c,
-    "locs_c": c_c,
-    "M": M, "K": K, "N": N,
-})
-```
-
-## Batching and Sync
-
-- Auto-batching is enabled by default:
-
-```python
-u.set_auto_batching(True, limit=4096)
-```
-
-- Disable auto-batching (submit each op immediately):
-
-```python
-u.set_auto_batching(False)
-```
-
-- Manual batching:
-
-```python
-with gpu.batch():
-    u.mop1(...)
-    u.mop2(...)
-```
-
-- Sync:
-
-```python
-gpu.synchronize_all()
-```
-
-## Low-level Adamah API (optional)
-
-The `Adamah` object exposes direct map ops (no string parsing):
-
-- `map_init`, `scatter`, `gather`
-- `map_op1`, `map_op2`, `map_reduce`, `map_broadcast`
-- `map_softmax`, `map_layernorm`, `map_matmul`
-- `batch_begin`, `batch_end`, `synchronize_all`
-
-## Array API (status)
-
-The `gpu.array`, `gpu.add`, and `gpu.mul` methods exist but are not implemented yet.
-Use maps + UUCIS instead.
+**Matrix**: matmul, softmax, layernorm, broadcast
 
 ## Requirements
 
-- Linux (Ubuntu 20.04+)
-- Vulkan drivers (`vulkaninfo` to check)
-- GCC (`build-essential`)
+- Linux with Vulkan-capable GPU
 - Python 3.8+
+- numpy
 
 ## License
 
-CC BY-NC 4.0 - Free for non-commercial use with attribution.
-
-(c) 2026 Samuele Scuglia
+CC-BY-NC-4.0
