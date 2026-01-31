@@ -1,4 +1,4 @@
-# ADAMAH 5.0
+# ADAMAH 5.0.0
 
 **High-Performance Cross-Platform GPU Computing Framework**
 
