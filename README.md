@@ -198,32 +198,6 @@ python benchmarks/benchmark_mixed_nonlinear.py
 python benchmarks/benchmark_simple_batches.py
 ```
 
-## 📁 Package Structure
-
-```
-adamah-clean/
-├── adamah/
-│   ├── __init__.py      # Main Python API
-│   ├── adamah.c         # C/Vulkan core
-│   ├── adamah.so        # Compiled library
-│   ├── uucis.py         # High-level API
-│   └── shaders/         # Precompiled SPIR-V shaders
-│       ├── map_op1.spv
-│       ├── map_op2.spv
-│       ├── map_matmul.spv
-│       ├── map_softmax.spv
-│       ├── map_layernorm.spv
-│       └── ...
-├── benchmarks/
-│   ├── benchmark_mixed_nonlinear.py
-│   └── benchmark_simple_batches.py
-├── tests/
-│   └── test_all_ops.py
-├── pyproject.toml
-├── LICENSE
-└── README.md
-```
-
 ## 🛠️ Compiling from Source
 
 If you need to recompile the C library:
