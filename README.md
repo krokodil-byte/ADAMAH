@@ -235,7 +235,7 @@ gcc -shared -fPIC -O3 -o adamah.so adamah.c -lvulkan -ldl
 
 ## 📄 License
 
-MIT License - see LICENSE file.
+CC-BY-NC 4.0 License - see LICENSE file.
 
 ## 🤝 Contributing
 
@@ -245,6 +245,4 @@ Contributions welcome! Areas of interest:
 - Support for more platforms
 - Documentation improvements
 
----
 
-**ADAMAH** - *Breaking the CUDA monopoly, one Vulkan dispatch at a time.*
