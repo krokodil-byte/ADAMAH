@@ -6,7 +6,7 @@ ADAMAH is a GPU compute framework that runs on **any GPU** via Vulkan - NVIDIA, 
 
 ## 🚀 Performance
 
-ADAMAH outperforms PyTorch (CUDA) by **2.5-4.5x** on transformer workloads:
+ADAMAH outperforms PyTorch (CUDA) by **2-4x** on transformer workloads:
 
 | Workload | vs PyTorch (CUDA) | vs CuPy |
 |----------|-------------------|---------|
