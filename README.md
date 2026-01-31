@@ -237,14 +237,6 @@ adamah-clean/
 └── README.md
 ```
 
-## 🛠️ Compiling from Source
-
-If you need to recompile the C library:
-
-```bash
-cd adamah
-gcc -shared -fPIC -O3 -o adamah.so adamah.c -lvulkan -ldl
-```
 
 ## 📄 License
 
