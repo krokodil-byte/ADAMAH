@@ -252,4 +252,4 @@ Contributions welcome! Areas of interest:
 
 ---
 
-**ADAMAH** - *Breaking the CUDA monopoly, one Vulkan dispatch at a time.*
+**ADAMAH** - *The Ground for computation.*
