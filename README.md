@@ -6,13 +6,13 @@ ADAMAH is a GPU compute framework that runs on **any GPU** via Vulkan - NVIDIA, 
 
 ## 🚀 Performance
 
-ADAMAH outperforms PyTorch (CUDA) by **2.5-4.5x** on transformer workloads:
+ADAMAH outperforms PyTorch (CUDA) by **2-4x** on transformer workloads:
 
 | Workload | vs PyTorch (CUDA) | vs CuPy |
 |----------|-------------------|---------|
-| Attention-FFN Block | **4.48x faster** | 20.25x |
-| Residual Chain | **3.55x faster** | 17.14x |
-| Multi-Head Attention | **2.62x faster** | 17.12x |
+| Attention-FFN Block | **4x faster** | 20x |
+| Residual Chain | **3.5x faster** | 17x |
+| Multi-Head Attention | **2.5x faster** | 17x |
 
 *Benchmarked on RTX 3070 with identical logical operations*
 
