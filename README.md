@@ -1,4 +1,4 @@
-# ADAMAH 5.1
+# ADAMAH 5.1.0
 
 **High-Performance Cross-Platform GPU Computing Framework**
 
@@ -248,7 +248,7 @@ gcc -shared -fPIC -O3 -o adamah.so adamah.c -lvulkan -ldl
 
 ## 📄 License
 
-MIT License - see LICENSE file.
+CC-BY-NC 4.0 License - see LICENSE file.
 
 ## 🤝 Contributing
 
