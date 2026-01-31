@@ -5,6 +5,7 @@ from typing import Any, Dict, Optional, Sequence, Tuple
 _UINT32_MAX = int(np.iinfo(np.uint32).max)
 
 _UNARY_OPS = {
+    # Basic math
     "NEG": 0,
     "ABS": 1,
     "SQRT": 2,
@@ -13,10 +14,38 @@ _UNARY_OPS = {
     "TANH": 5,
     "RELU": 6,
     "GELU": 7,
+    # Trig
     "SIN": 8,
     "COS": 9,
-    "RECIP": 10,
-    "SQR": 11,
+    "TAN": 10,
+    "ASIN": 11,
+    "ACOS": 12,
+    "ATAN": 13,
+    "SINH": 14,
+    "COSH": 15,
+    # Activations
+    "SIGMOID": 16,
+    "SWISH": 17,
+    "MISH": 18,
+    "SELU": 19,
+    "ELU": 20,
+    "LEAKY_RELU": 21,
+    # Rounding
+    "CEIL": 22,
+    "FLOOR": 23,
+    "ROUND": 24,
+    "SIGN": 25,
+    # Extra math
+    "RECIP": 26,
+    "RECIPROCAL": 26,  # alias
+    "SQR": 27,
+    "SQUARE": 27,  # alias
+    "CUBE": 28,
+    "SOFTPLUS": 29,
+    "HARDSIGMOID": 30,
+    "HARDSWISH": 31,
+    "EXPM1": 32,
+    "LOG1P": 33,
 }
 
 _BINARY_OPS = {
@@ -330,6 +359,10 @@ class UUCISView:
     # Scatter / Gather
     # ------------------------------------------------------------------
     def scatter(self, map_id: int, location_list, data):
+        # Auto-sync: flush fusion queue before writing new data
+        # This prevents race conditions with pending operations
+        self._gpu.synchronize_all()
+        
         meta = self._ensure_meta(map_id)
         if self._strict_cached_ops and not isinstance(location_list, CachedVar):
             raise RuntimeError("scatter requires cached locs (use cache_locs)")
@@ -369,6 +402,9 @@ class UUCISView:
         return self._gpu.map_scatter(map_id, locs, arr)
 
     def gather(self, map_id: int, location_list, target=None):
+        # Auto-sync: flush fusion queue before gathering results
+        self._gpu.synchronize_all()
+        
         meta = self._ensure_meta(map_id)
         if self._strict_cached_ops and not isinstance(location_list, CachedVar):
             raise RuntimeError("gather requires cached locs (use cache_locs)")
@@ -951,3 +987,19 @@ class UUCISView:
             locs = np.arange(arr.size, dtype=np.uint32)
             return self.scatter(int(target), locs, arr)
         return res
+
+    # ============================================
+    # Synchronization
+    # ============================================
+    
+    def sync(self):
+        """Synchronize: flush all pending operations and wait for completion.
+        
+        This is called automatically before gather(), but you can call it
+        explicitly if you need to ensure all GPU operations have completed.
+        """
+        self._gpu.synchronize_all()
+    
+    def flush(self):
+        """Alias for sync() - flush pending operations."""
+        self.sync()

@@ -709,13 +709,13 @@ def main():
         # Warmup
         for _ in range(3):
             block1_adamah()
-        gpu.synchronize_all()  # lightweight sync - no data transfer
+        u.sync()  # lightweight sync - no data transfer
         
         # ADAMAH
         t0 = now_ms()
         for _ in range(n_iter):
             block1_adamah()
-        gpu.synchronize_all()  # lightweight sync
+        u.sync()  # lightweight sync
         adamah_time = (now_ms() - t0) / n_iter
         
         # PyTorch
@@ -773,13 +773,13 @@ def main():
         # Warmup
         for _ in range(3):
             block2_adamah()
-        gpu.synchronize_all()
+        u.sync()
         
         # ADAMAH
         t0 = now_ms()
         for _ in range(n_iter):
             block2_adamah()
-        gpu.synchronize_all()
+        u.sync()
         adamah_time = (now_ms() - t0) / n_iter
         
         # PyTorch
@@ -838,13 +838,13 @@ def main():
         # Warmup
         for _ in range(3):
             block3_adamah()
-        gpu.synchronize_all()
+        u.sync()
         
         # ADAMAH
         t0 = now_ms()
         for _ in range(n_iter):
             block3_adamah()
-        gpu.synchronize_all()
+        u.sync()
         adamah_time = (now_ms() - t0) / n_iter
         
         # PyTorch

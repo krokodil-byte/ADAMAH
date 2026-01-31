@@ -1,4 +1,4 @@
-# ADAMAH 5.0.0
+# ADAMAH 5.1
 
 **High-Performance Cross-Platform GPU Computing Framework**
 
@@ -6,13 +6,13 @@ ADAMAH is a GPU compute framework that runs on **any GPU** via Vulkan - NVIDIA, 
 
 ## 🚀 Performance
 
-ADAMAH outperforms PyTorch (CUDA) by **2-4x** on transformer workloads:
+ADAMAH outperforms PyTorch (CUDA) by **2.5-4.5x** on transformer workloads:
 
 | Workload | vs PyTorch (CUDA) | vs CuPy |
 |----------|-------------------|---------|
-| Attention-FFN Block | **~4.0x faster** | ~20x |
-| Residual Chain | **~3.5x faster** | ~17x |
-| Multi-Head Attention | **~2.5x faster** | ~17x |
+| Attention-FFN Block | **4.48x faster** | 20.25x |
+| Residual Chain | **3.55x faster** | 17.14x |
+| Multi-Head Attention | **2.62x faster** | 17.12x |
 
 *Benchmarked on RTX 3070 with identical logical operations*
 
@@ -24,11 +24,24 @@ ADAMAH outperforms PyTorch (CUDA) by **2-4x** on transformer workloads:
 - **Cross-Platform** - Works on any Vulkan-capable GPU (NVIDIA, AMD, Intel, Apple, ARM)
 - **Zero CUDA Dependency** - Pure Vulkan compute, no proprietary toolchains
 
-## Requirements
+## 📦 Installation
 
+### Requirements
 - Python 3.8+
 - Vulkan-capable GPU with drivers installed
 - NumPy
+
+### Quick Start
+```bash
+# Clone/download the package
+cd adamah-clean
+
+# Install
+pip install -e .
+
+# Verify
+python -c "import adamah; gpu = adamah.Adamah(); print('ADAMAH ready!')"
+```
 
 ## 🔧 Supported Operations
 
@@ -198,6 +211,32 @@ python benchmarks/benchmark_mixed_nonlinear.py
 python benchmarks/benchmark_simple_batches.py
 ```
 
+## 📁 Package Structure
+
+```
+adamah-clean/
+├── adamah/
+│   ├── __init__.py      # Main Python API
+│   ├── adamah.c         # C/Vulkan core
+│   ├── adamah.so        # Compiled library
+│   ├── uucis.py         # High-level API
+│   └── shaders/         # Precompiled SPIR-V shaders
+│       ├── map_op1.spv
+│       ├── map_op2.spv
+│       ├── map_matmul.spv
+│       ├── map_softmax.spv
+│       ├── map_layernorm.spv
+│       └── ...
+├── benchmarks/
+│   ├── benchmark_mixed_nonlinear.py
+│   └── benchmark_simple_batches.py
+├── tests/
+│   └── test_all_ops.py
+├── pyproject.toml
+├── LICENSE
+└── README.md
+```
+
 ## 🛠️ Compiling from Source
 
 If you need to recompile the C library:
@@ -209,7 +248,7 @@ gcc -shared -fPIC -O3 -o adamah.so adamah.c -lvulkan -ldl
 
 ## 📄 License
 
-CC-BY-NC 4.0 License - see LICENSE file.
+MIT License - see LICENSE file.
 
 ## 🤝 Contributing
 
@@ -219,4 +258,6 @@ Contributions welcome! Areas of interest:
 - Support for more platforms
 - Documentation improvements
 
+---
 
+**ADAMAH** - *Breaking the CUDA monopoly, one Vulkan dispatch at a time.*

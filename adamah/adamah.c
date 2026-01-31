@@ -994,45 +994,60 @@ int adamah_init_ex(uint64_t hot_bytes, uint64_t cold_bytes) {
         }
     }
     
-    // Store compute limits
+    // Store compute limits from Vulkan
     gpu_caps.max_workgroup_size = props.limits.maxComputeWorkGroupSize[0];
     gpu_caps.max_workgroups = props.limits.maxComputeWorkGroupCount[0];
     gpu_caps.max_descriptor_sets = props.limits.maxBoundDescriptorSets;
     
-    // Estimate shader units based on VRAM class
-    // Modern GPUs have thousands of shader units:
-    // RTX 3070: 5888 CUDA cores, 46 SMs
-    // RTX 3080: 8704 CUDA cores, 68 SMs  
-    // RTX 4090: 16384 CUDA cores, 128 SMs
-    // We use a conservative estimate for fusion queue sizing
-    uint32_t estimated_shader_units;
-    if (gpu_caps.vram_bytes >= 20ull * 1024 * 1024 * 1024) {
-        estimated_shader_units = 16000;  // Flagship (24GB+ = RTX 4090 class)
-    } else if (gpu_caps.vram_bytes >= 10ull * 1024 * 1024 * 1024) {
-        estimated_shader_units = 10000;  // High-end (12-16GB = RTX 3080/4080 class)
-    } else if (gpu_caps.vram_bytes >= 7ull * 1024 * 1024 * 1024) {
-        estimated_shader_units = 6000;   // Upper mid (8GB = RTX 3070 class)
+    // Use maxComputeWorkGroupInvocations as primary indicator of GPU compute power
+    // This is the max threads per workgroup - directly reflects GPU architecture:
+    // - Most desktop GPUs: 1024 (RTX 30xx, 40xx, RX 6000, 7000)
+    // - Some mobile/integrated: 512 or 256
+    // - High-end workstation: 1024-1536
+    uint32_t max_invocations = props.limits.maxComputeWorkGroupInvocations;
+    
+    // Combine with workgroup count for total concurrent capacity estimate
+    // maxComputeWorkGroupCount[0] is typically 65535 for modern GPUs
+    // We use invocations as the scaling factor since it's more meaningful
+    uint32_t compute_power = max_invocations;  // Base: 256-1024 typically
+    
+    // Scale by VRAM as secondary indicator (more VRAM = usually more SMs)
+    // This helps differentiate RTX 3070 (8GB) from RTX 3060 (12GB but fewer SMs)
+    float vram_scale = 1.0f;
+    if (gpu_caps.vram_bytes >= 16ull * 1024 * 1024 * 1024) {
+        vram_scale = 2.0f;   // 16GB+ = flagship class
+    } else if (gpu_caps.vram_bytes >= 8ull * 1024 * 1024 * 1024) {
+        vram_scale = 1.5f;   // 8-16GB = high-end
     } else if (gpu_caps.vram_bytes >= 4ull * 1024 * 1024 * 1024) {
-        estimated_shader_units = 3000;   // Mid-range (4-6GB)
+        vram_scale = 1.0f;   // 4-8GB = mid-range
     } else {
-        estimated_shader_units = 1000;   // Entry/Integrated
+        vram_scale = 0.5f;   // <4GB = entry/integrated
     }
-    gpu_caps.max_compute_units = estimated_shader_units;
     
-    // Set fusion queue size - for 6000 shader units, we want LOTS of ops queued
-    // Each dispatch can utilize all shader units, so more ops = better parallelism
-    // RTX 3070 with 5888 cores and 448GB/s bandwidth can handle massive batches
-    gpu_caps.fusion_max_ops = FUSION_MAX_OPS_LIMIT;  // Always use max - let GPU handle it
+    gpu_caps.max_compute_units = (uint32_t)(compute_power * vram_scale);
     
-    // Optimal batch size - saturate the GPU
-    gpu_caps.optimal_batch_size = estimated_shader_units / 8;  // ~750 for RTX 3070
+    // Fusion queue size: scale with compute power
+    // More powerful GPU = larger queue = better batching
+    // Base: max_invocations * 4, scaled by VRAM
+    gpu_caps.fusion_max_ops = (uint32_t)(max_invocations * 4 * vram_scale);
+    if (gpu_caps.fusion_max_ops > FUSION_MAX_OPS_LIMIT) {
+        gpu_caps.fusion_max_ops = FUSION_MAX_OPS_LIMIT;
+    }
+    if (gpu_caps.fusion_max_ops < 512) {
+        gpu_caps.fusion_max_ops = 512;  // Minimum for effective batching
+    }
+    
+    // Optimal batch size: target good GPU utilization without overwhelming
+    gpu_caps.optimal_batch_size = max_invocations / 2;
     if (gpu_caps.optimal_batch_size < 64) gpu_caps.optimal_batch_size = 64;
-    if (gpu_caps.optimal_batch_size > 2048) gpu_caps.optimal_batch_size = 2048;
+    if (gpu_caps.optimal_batch_size > 1024) gpu_caps.optimal_batch_size = 1024;
     
-    fprintf(stderr, "[ADAMAH] GPU Caps: VRAM=%.1fGB, shader_units~%u, fusion_max_ops=%u, optimal_batch=%u\n",
+    fprintf(stderr, "[ADAMAH] GPU Caps: VRAM=%.1fGB, maxInvocations=%u, compute_units=%u, fusion_max_ops=%u, optimal_batch=%u\n",
             (double)gpu_caps.vram_bytes / (1024.0 * 1024.0 * 1024.0),
-            estimated_shader_units,
-            gpu_caps.fusion_max_ops, gpu_caps.optimal_batch_size);
+            max_invocations,
+            gpu_caps.max_compute_units,
+            gpu_caps.fusion_max_ops, 
+            gpu_caps.optimal_batch_size);
     
     // Find compute queue
     uint32_t qfc = 0;

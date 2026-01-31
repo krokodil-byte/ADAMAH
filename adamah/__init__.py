@@ -27,7 +27,7 @@ import os
 from contextlib import contextmanager
 from typing import Optional, Tuple
 
-__version__ = "4.2.0"
+__version__ = "5.1.0"
 
 # Import UUCIS wrapper for benchmark compatibility
 try:
