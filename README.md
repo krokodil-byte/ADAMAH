@@ -31,17 +31,6 @@ ADAMAH outperforms PyTorch (CUDA) by **2-4x** on transformer workloads:
 - Vulkan-capable GPU with drivers installed
 - NumPy
 
-### Quick Start
-```bash
-# Clone/download the package
-cd adamah-clean
-
-# Install
-pip install -e .
-
-# Verify
-python -c "import adamah; gpu = adamah.Adamah(); print('ADAMAH ready!')"
-```
 
 ## 🔧 Supported Operations
 
