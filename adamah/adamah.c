@@ -39,6 +39,12 @@
 #define RES_TYPE_CVAR 1
 #define RES_TYPE_LOCS 2
 
+// Data types
+#define DTYPE_F32  0
+#define DTYPE_BF16 1
+#define DTYPE_Q8   2
+#define DTYPE_COUNT 3
+
 // Fusion system constants - maximums, actual values set dynamically
 #define FUSION_MAX_OPS_LIMIT 8192
 #define FUSION_MAX_LEVELS 128
@@ -55,6 +61,9 @@
 
 // Forward declarations
 int map_destroy(uint32_t id);
+int map_init_dtype(uint32_t id, uint32_t dtype, uint32_t pack_size, uint32_t n_packs, uint32_t group_size);
+int adamah_set_dtype(uint32_t dtype);
+int map_set_qparams(uint32_t map_id, const float* scales, const float* zero_points, uint32_t n_groups);
 
 // Fusion operation entry
 typedef struct {
@@ -123,8 +132,9 @@ static GpuBuf* get_or_create_buf_ex(const char* base_name, uint32_t n_elems, uin
 // Memory Map - the core data structure
 typedef struct {
     int active;
-    uint32_t word_size;   // Bytes per word (4 = float)
-    uint32_t pack_size;   // Words per pack
+    uint32_t word_size;   // Bytes per word (4=f32, 2=bf16, 1=q8)
+    uint32_t dtype;       // DTYPE_F32, DTYPE_BF16, DTYPE_Q8
+    uint32_t pack_size;   // Words per pack (logical elements)
     uint32_t n_packs;     // Number of packs
     uint64_t total_bytes;
 
@@ -136,6 +146,15 @@ typedef struct {
     VkDeviceMemory staging_mem;
     void* staging_ptr;
     VkMemoryPropertyFlags staging_mem_props;  // Track memory properties for flush/invalidate
+
+    // Quantization params (for DTYPE_Q8)
+    uint32_t group_size;     // Elements per quantization group
+    VkBuffer qparam_buf;     // GPU buffer for [scale, zp] per group
+    VkDeviceMemory qparam_mem;
+    void* qparam_staging_ptr;
+    VkBuffer qparam_staging;
+    VkDeviceMemory qparam_staging_mem;
+    uint32_t n_groups;       // Number of quantization groups
 } Map;
 
 // Compute pipeline
@@ -222,8 +241,24 @@ static struct {
     Pipeline unified_pipe;
     Pipeline scatter_pipe;
     Pipeline gather_pipe;
+
+    char shader_path[512];  // Must be before dtype arrays to avoid corruption
+
+    // Per-dtype pipeline sets (bf16, q8)
+    // Index: 0=f32 (uses the pipes above), 1=bf16, 2=q8
+    Pipeline dtype_scatter_pipe[DTYPE_COUNT];
+    Pipeline dtype_gather_pipe[DTYPE_COUNT];
+    Pipeline dtype_unary_pipe[DTYPE_COUNT];
+    Pipeline dtype_binary_pipe[DTYPE_COUNT];
+    Pipeline dtype_matmul_pipe[DTYPE_COUNT];
+    Pipeline dtype_reduce_pipe[DTYPE_COUNT];
+    Pipeline dtype_reduce_small_pipe[DTYPE_COUNT];
+    Pipeline dtype_broadcast_pipe[DTYPE_COUNT];
+    Pipeline dtype_softmax_pipe[DTYPE_COUNT];
+    Pipeline dtype_layernorm_pipe[DTYPE_COUNT];
+    int dtype_pipes_loaded[DTYPE_COUNT];  // Tracks which dtype sets are loaded
     
-    char shader_path[512];
+    uint32_t active_dtype;   // Currently active dtype for new maps
 } ctx = {0};
 
 // ============================================
@@ -1216,14 +1251,51 @@ void adamah_shutdown(void) {
 // ============================================
 
 int map_init(uint32_t id, uint32_t word_size, uint32_t pack_size, uint32_t n_packs) {
+    // Legacy: word_size=4 → f32, word_size=2 → bf16, word_size=1 → q8
+    uint32_t dtype = DTYPE_F32;
+    if (word_size == 2) dtype = DTYPE_BF16;
+    else if (word_size == 1) dtype = DTYPE_Q8;
+    return map_init_dtype(id, dtype, pack_size, n_packs, 128);
+}
+
+// New dtype-aware init
+int map_init_dtype(uint32_t id, uint32_t dtype, uint32_t pack_size, uint32_t n_packs, uint32_t group_size) {
     if (!ctx.initialized || id >= MAX_MAPS) return ADAMAH_ERR_INVALID;
+    if (dtype >= DTYPE_COUNT) return ADAMAH_ERR_INVALID;
     if (ctx.maps[id].active) map_destroy(id);
     
     Map* m = &ctx.maps[id];
-    m->word_size = word_size;
+    m->dtype = dtype;
     m->pack_size = pack_size;
     m->n_packs = n_packs;
-    m->total_bytes = (uint64_t)word_size * pack_size * n_packs;
+    m->group_size = (dtype == DTYPE_Q8) ? group_size : 0;
+    
+    // Set word_size based on dtype
+    switch (dtype) {
+        case DTYPE_F32:  m->word_size = 4; break;
+        case DTYPE_BF16: m->word_size = 2; break;
+        case DTYPE_Q8:   m->word_size = 1; break;
+        default:         m->word_size = 4; break;
+    }
+    
+    // Calculate total bytes for GPU storage
+    // For bf16: pack 2 elements per uint32, so bytes = ceil(elements/2) * 4
+    // For q8: pack 4 elements per uint32, so bytes = ceil(elements/4) * 4
+    uint64_t total_elements = (uint64_t)pack_size * n_packs;
+    switch (dtype) {
+        case DTYPE_F32:
+            m->total_bytes = total_elements * 4;
+            break;
+        case DTYPE_BF16:
+            m->total_bytes = ((total_elements + 1) / 2) * 4;
+            break;
+        case DTYPE_Q8:
+            m->total_bytes = ((total_elements + 3) / 4) * 4;
+            break;
+        default:
+            m->total_bytes = total_elements * 4;
+            break;
+    }
     
     // GPU buffer (DEVICE_LOCAL)
     VkBufferUsageFlags usage = VK_BUFFER_USAGE_STORAGE_BUFFER_BIT |
@@ -1247,6 +1319,51 @@ int map_init(uint32_t id, uint32_t word_size, uint32_t pack_size, uint32_t n_pac
     vkCmdCopyBuffer(ctx.cmd, m->staging, m->buf, 1, &copy);
     cmd_submit();
     
+    // Allocate quantization params buffer for q8
+    m->qparam_buf = VK_NULL_HANDLE;
+    m->qparam_mem = VK_NULL_HANDLE;
+    m->qparam_staging = VK_NULL_HANDLE;
+    m->qparam_staging_mem = VK_NULL_HANDLE;
+    m->qparam_staging_ptr = NULL;
+    m->n_groups = 0;
+    
+    if (dtype == DTYPE_Q8 && group_size > 0) {
+        uint64_t total_elems = (uint64_t)pack_size * n_packs;
+        m->n_groups = (uint32_t)((total_elems + group_size - 1) / group_size);
+        VkDeviceSize qparam_bytes = (VkDeviceSize)m->n_groups * 2 * sizeof(float);
+        
+        if (create_buffer(&m->qparam_buf, &m->qparam_mem, qparam_bytes, usage, 1) != 0) {
+            vkUnmapMemory(ctx.device, m->staging_mem);
+            vkDestroyBuffer(ctx.device, m->staging, NULL);
+            vkFreeMemory(ctx.device, m->staging_mem, NULL);
+            vkDestroyBuffer(ctx.device, m->buf, NULL);
+            vkFreeMemory(ctx.device, m->mem, NULL);
+            return ADAMAH_ERR_MEMORY;
+        }
+        VkMemoryPropertyFlags qprops;
+        if (create_buffer_ex(&m->qparam_staging, &m->qparam_staging_mem, qparam_bytes, usage, 0, &qprops) != 0) {
+            vkDestroyBuffer(ctx.device, m->qparam_buf, NULL);
+            vkFreeMemory(ctx.device, m->qparam_mem, NULL);
+            vkUnmapMemory(ctx.device, m->staging_mem);
+            vkDestroyBuffer(ctx.device, m->staging, NULL);
+            vkFreeMemory(ctx.device, m->staging_mem, NULL);
+            vkDestroyBuffer(ctx.device, m->buf, NULL);
+            vkFreeMemory(ctx.device, m->mem, NULL);
+            return ADAMAH_ERR_MEMORY;
+        }
+        vkMapMemory(ctx.device, m->qparam_staging_mem, 0, qparam_bytes, 0, &m->qparam_staging_ptr);
+        // Init scale=1.0, zp=0.0
+        float* qp = (float*)m->qparam_staging_ptr;
+        for (uint32_t g = 0; g < m->n_groups; g++) {
+            qp[g * 2] = 1.0f;
+            qp[g * 2 + 1] = 0.0f;
+        }
+        cmd_begin();
+        VkBufferCopy qcopy = { .size = qparam_bytes };
+        vkCmdCopyBuffer(ctx.cmd, m->qparam_staging, m->qparam_buf, 1, &qcopy);
+        cmd_submit();
+    }
+    
     m->active = 1;
     return ADAMAH_OK;
 }
@@ -1260,6 +1377,17 @@ int map_destroy(uint32_t id) {
     vkFreeMemory(ctx.device, m->staging_mem, NULL);
     vkDestroyBuffer(ctx.device, m->buf, NULL);
     vkFreeMemory(ctx.device, m->mem, NULL);
+    
+    // Cleanup q8 params
+    if (m->qparam_buf != VK_NULL_HANDLE) {
+        if (m->qparam_staging_ptr) vkUnmapMemory(ctx.device, m->qparam_staging_mem);
+        if (m->qparam_staging != VK_NULL_HANDLE) {
+            vkDestroyBuffer(ctx.device, m->qparam_staging, NULL);
+            vkFreeMemory(ctx.device, m->qparam_staging_mem, NULL);
+        }
+        vkDestroyBuffer(ctx.device, m->qparam_buf, NULL);
+        vkFreeMemory(ctx.device, m->qparam_mem, NULL);
+    }
     
     memset(m, 0, sizeof(Map));
     return ADAMAH_OK;
@@ -2161,6 +2289,146 @@ static int init_pipelines(void) {
     }
     
     return ADAMAH_OK;
+}
+
+// Load dtype-specific pipelines from subdirectory
+static int init_dtype_pipelines(uint32_t dtype) {
+    if (dtype >= DTYPE_COUNT) return ADAMAH_ERR_INVALID;
+    if (ctx.dtype_pipes_loaded[dtype]) return ADAMAH_OK;
+    
+    // For f32, copy from the main (legacy) pipelines
+    if (dtype == DTYPE_F32) {
+        ctx.dtype_scatter_pipe[0] = ctx.scatter_pipe;
+        ctx.dtype_gather_pipe[0] = ctx.gather_pipe;
+        ctx.dtype_unary_pipe[0] = ctx.unary_pipe;
+        ctx.dtype_binary_pipe[0] = ctx.binary_pipe;
+        ctx.dtype_matmul_pipe[0] = ctx.matmul_pipe;
+        ctx.dtype_reduce_pipe[0] = ctx.reduce_pipe;
+        ctx.dtype_reduce_small_pipe[0] = ctx.reduce_small_pipe;
+        ctx.dtype_broadcast_pipe[0] = ctx.broadcast_pipe;
+        ctx.dtype_softmax_pipe[0] = ctx.softmax_pipe;
+        ctx.dtype_layernorm_pipe[0] = ctx.layernorm_pipe;
+        ctx.dtype_pipes_loaded[0] = 1;
+        return ADAMAH_OK;
+    }
+    
+    // Build shader subdir path
+    const char* dtype_names[] = { "f32", "bf16", "q8" };
+    char saved_path[512];
+    strncpy(saved_path, ctx.shader_path, 511);
+    saved_path[511] = '\0';
+    
+    char dtype_path[600];
+    snprintf(dtype_path, sizeof(dtype_path), "%s/%s", saved_path, dtype_names[dtype]);
+    
+    // Check if dtype shaders exist
+    char test[700];
+    snprintf(test, sizeof(test), "%s/map_scatter.spv", dtype_path);
+    FILE* f = fopen(test, "rb");
+    if (!f) {
+        fprintf(stderr, "ADAMAH: %s shaders not found at %s\n", dtype_names[dtype], dtype_path);
+        return ADAMAH_ERR_NOT_FOUND;
+    }
+    fclose(f);
+    
+    // Temporarily switch shader_path for pipeline creation
+    strncpy(ctx.shader_path, dtype_path, 511);
+    
+    int ok = 1;
+    if (dtype == DTYPE_BF16) {
+        // bf16 scatter/gather: push = 8 bytes, 3 bindings
+        ok &= (create_pipeline(&ctx.dtype_scatter_pipe[dtype], "map_scatter.spv", 3, 8) == 0);
+        ok &= (create_pipeline(&ctx.dtype_gather_pipe[dtype], "map_gather.spv", 3, 8) == 0);
+        // bf16 unary/binary: same push sizes as f32
+        ok &= (create_pipeline(&ctx.dtype_unary_pipe[dtype], "map_op1.spv", 3, 12) == 0);
+        ok &= (create_pipeline(&ctx.dtype_binary_pipe[dtype], "map_op2.spv", 4, 12) == 0);
+        ok &= (create_pipeline(&ctx.dtype_matmul_pipe[dtype], "map_matmul.spv", 4, 16) == 0);
+        ok &= (create_pipeline(&ctx.dtype_reduce_pipe[dtype], "map_reduce.spv", 3, 12) == 0);
+        ok &= (create_pipeline(&ctx.dtype_reduce_small_pipe[dtype], "map_reduce_small.spv", 3, 12) == 0);
+        ok &= (create_pipeline(&ctx.dtype_broadcast_pipe[dtype], "map_broadcast.spv", 4, 12) == 0);
+        ok &= (create_pipeline(&ctx.dtype_softmax_pipe[dtype], "map_softmax.spv", 3, 8) == 0);
+        ok &= (create_pipeline(&ctx.dtype_layernorm_pipe[dtype], "map_layernorm.spv", 5, 12) == 0);
+    }
+    else if (dtype == DTYPE_Q8) {
+        // q8 scatter: push = 12 bytes (n_locs, pack_size, group_size), 4 bindings (+qparams)
+        ok &= (create_pipeline(&ctx.dtype_scatter_pipe[dtype], "map_scatter.spv", 4, 12) == 0);
+        ok &= (create_pipeline(&ctx.dtype_gather_pipe[dtype], "map_gather.spv", 4, 12) == 0);
+        // q8 matmul: push = 20 bytes (M,K,N,n_ops,group_size), 5 bindings (+qparams)
+        ok &= (create_pipeline(&ctx.dtype_matmul_pipe[dtype], "map_matmul.spv", 5, 20) == 0);
+    }
+    
+    // Restore shader path
+    strncpy(ctx.shader_path, saved_path, 511);
+    
+    if (!ok) {
+        fprintf(stderr, "ADAMAH: Failed to load some %s pipelines\n", dtype_names[dtype]);
+        return ADAMAH_ERR_VULKAN;
+    }
+    
+    ctx.dtype_pipes_loaded[dtype] = 1;
+    fprintf(stderr, "ADAMAH: Loaded %s shader pipelines\n", dtype_names[dtype]);
+    return ADAMAH_OK;
+}
+
+// Public API: set active dtype and load pipelines
+int adamah_set_dtype(uint32_t dtype) {
+    if (!ctx.initialized) return ADAMAH_ERR_INVALID;
+    if (dtype >= DTYPE_COUNT) return ADAMAH_ERR_INVALID;
+
+    // Ensure base pipelines are initialized (sets ctx.shader_path)
+    if (!ctx.shader_path[0]) {
+        int ret = init_pipelines();
+        if (ret != ADAMAH_OK) return ret;
+    }
+
+    // Ensure f32 pipelines are loaded first (base requirement)
+    if (!ctx.dtype_pipes_loaded[DTYPE_F32]) {
+        init_dtype_pipelines(DTYPE_F32);
+    }
+    
+    // Load dtype-specific pipelines if needed
+    if (!ctx.dtype_pipes_loaded[dtype]) {
+        int ret = init_dtype_pipelines(dtype);
+        if (ret != ADAMAH_OK) return ret;
+    }
+    
+    ctx.active_dtype = dtype;
+    return ADAMAH_OK;
+}
+
+uint32_t adamah_get_dtype(void) {
+    return ctx.active_dtype;
+}
+
+// ============================================
+// Quantization API
+// ============================================
+
+// Upload quantization parameters for a q8 map
+int map_set_qparams(uint32_t map_id, const float* scales, const float* zero_points, uint32_t n_groups) {
+    if (map_id >= MAX_MAPS || !ctx.maps[map_id].active) return ADAMAH_ERR_INVALID;
+    Map* m = &ctx.maps[map_id];
+    if (m->dtype != DTYPE_Q8) return ADAMAH_ERR_INVALID;
+    if (n_groups > m->n_groups) return ADAMAH_ERR_INVALID;
+    
+    float* qp = (float*)m->qparam_staging_ptr;
+    for (uint32_t g = 0; g < n_groups; g++) {
+        qp[g * 2] = scales[g];
+        qp[g * 2 + 1] = zero_points[g];
+    }
+    
+    cmd_begin();
+    VkBufferCopy copy = { .size = (VkDeviceSize)n_groups * 2 * sizeof(float) };
+    vkCmdCopyBuffer(ctx.cmd, m->qparam_staging, m->qparam_buf, 1, &copy);
+    cmd_submit();
+    
+    return ADAMAH_OK;
+}
+
+// Get map dtype
+uint32_t map_get_dtype(uint32_t map_id) {
+    if (map_id >= MAX_MAPS || !ctx.maps[map_id].active) return DTYPE_F32;
+    return ctx.maps[map_id].dtype;
 }
 
 // ============================================

@@ -332,6 +332,120 @@ class Adamah:
         self._lib.batch_end.argtypes = []
         self._lib.batch_end.restype = None
 
+        # Dtype system
+        self._try_setup_dtype()
+
+    def _try_setup_dtype(self):
+        """Setup dtype-related ctypes if available."""
+        try:
+            fn = self._lib.adamah_set_dtype
+            fn.argtypes = [ctypes.c_uint32]
+            fn.restype = ctypes.c_int
+
+            fn2 = self._lib.adamah_get_dtype
+            fn2.argtypes = []
+            fn2.restype = ctypes.c_uint32
+
+            fn3 = self._lib.map_init_dtype
+            fn3.argtypes = [ctypes.c_uint32, ctypes.c_uint32, ctypes.c_uint32, ctypes.c_uint32, ctypes.c_uint32]
+            fn3.restype = ctypes.c_int
+
+            fn4 = self._lib.map_set_qparams
+            fn4.argtypes = [ctypes.c_uint32, ctypes.POINTER(ctypes.c_float),
+                            ctypes.POINTER(ctypes.c_float), ctypes.c_uint32]
+            fn4.restype = ctypes.c_int
+
+            fn5 = self._lib.map_get_dtype
+            fn5.argtypes = [ctypes.c_uint32]
+            fn5.restype = ctypes.c_uint32
+
+            self._has_dtype = True
+        except (AttributeError, OSError):
+            self._has_dtype = False
+
+    # ============================================
+    # Dtype API
+    # ============================================
+
+    # Dtype constants
+    DTYPE_F32 = 0
+    DTYPE_BF16 = 1
+    DTYPE_Q8 = 2
+
+    def set_dtype(self, dtype: int):
+        """Set active dtype and load corresponding shader pipelines.
+        
+        Args:
+            dtype: DTYPE_F32 (0), DTYPE_BF16 (1), or DTYPE_Q8 (2)
+        
+        Call this ONCE after init, before creating maps.
+        This loads the shader set for the chosen dtype.
+        """
+        if not self._has_dtype:
+            raise RuntimeError("Dtype support not available - recompile adamah.so")
+        ret = self._lib.adamah_set_dtype(ctypes.c_uint32(dtype))
+        if ret != 0:
+            names = {0: 'f32', 1: 'bf16', 2: 'q8'}
+            raise RuntimeError(f"Failed to set dtype {names.get(dtype, dtype)} (code {ret})")
+
+    def get_dtype(self) -> int:
+        """Get currently active dtype."""
+        if not self._has_dtype:
+            return 0
+        return int(self._lib.adamah_get_dtype())
+
+    def map_create_typed(self, map_id: int, dtype: int, pack_size: int, n_packs: int, group_size: int = 128):
+        """Create a memory map with explicit dtype.
+        
+        Args:
+            map_id: Map ID (0-15)
+            dtype: DTYPE_F32, DTYPE_BF16, or DTYPE_Q8
+            pack_size: Elements per pack (logical, NOT bytes)
+            n_packs: Number of packs
+            group_size: Quantization group size for DTYPE_Q8 (default 128)
+        """
+        if not self._has_dtype:
+            raise RuntimeError("Dtype support not available - recompile adamah.so")
+        
+        ret = self._lib.map_init_dtype(
+            ctypes.c_uint32(map_id),
+            ctypes.c_uint32(dtype),
+            ctypes.c_uint32(pack_size),
+            ctypes.c_uint32(n_packs),
+            ctypes.c_uint32(group_size)
+        )
+        if ret != 0:
+            raise RuntimeError(f"map_init_dtype failed with code {ret}")
+
+        # word_size for metadata
+        ws = {0: 4, 1: 2, 2: 1}[dtype]
+        np_dtype = {0: np.float32, 1: np.float32, 2: np.float32}[dtype]
+        self._maps[map_id] = (ws, pack_size, n_packs, np_dtype)
+
+    def set_qparams(self, map_id: int, scales: np.ndarray, zero_points: np.ndarray):
+        """Set quantization parameters for a q8 map.
+        
+        Args:
+            map_id: Map ID of a DTYPE_Q8 map
+            scales: float32 array of scale per group
+            zero_points: float32 array of zero_point per group
+        """
+        if not self._has_dtype:
+            raise RuntimeError("Dtype support not available - recompile adamah.so")
+        
+        scales = np.ascontiguousarray(scales, dtype=np.float32)
+        zero_points = np.ascontiguousarray(zero_points, dtype=np.float32)
+        n_groups = len(scales)
+        
+        ret = self._lib.map_set_qparams(
+            ctypes.c_uint32(map_id),
+            scales.ctypes.data_as(ctypes.POINTER(ctypes.c_float)),
+            zero_points.ctypes.data_as(ctypes.POINTER(ctypes.c_float)),
+            ctypes.c_uint32(n_groups)
+        )
+        if ret != 0:
+            raise RuntimeError(f"map_set_qparams failed with code {ret}")
+
     # ============================================
     # Map Operations (for compatibility)
     # ============================================

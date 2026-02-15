@@ -1,6 +1,11 @@
 #!/usr/bin/env python3
 """
-ADAMAH Benchmark: Mixed Non-Linear Operations
+ADAMAH Benchmark: Mixed Non-Linear Operations (multi-dtype)
+
+Usage:
+    python benchmark_mixed_nonlinear.py                # default: f32
+    python benchmark_mixed_nonlinear.py --dtype bf16   # bfloat16 shaders
+    python benchmark_mixed_nonlinear.py --dtype q8     # int8 quantized (skips most blocks)
 
 Tests realistic workloads with:
 - Parallel branches (independent ops at same level)
@@ -14,6 +19,7 @@ Compares ADAMAH vs PyTorch vs CuPy with IDENTICAL logical structure.
 import os
 import sys
 import time
+import argparse
 import numpy as np
 
 # Setup paths FIRST
@@ -21,6 +27,9 @@ HERE = os.path.dirname(os.path.abspath(__file__))
 ROOT = os.path.abspath(os.path.join(HERE, ".."))
 if ROOT not in sys.path:
     sys.path.insert(0, ROOT)
+
+# Ensure CWD is the project root so adamah.so finds shaders/{f32,bf16,q8}/
+os.chdir(ROOT)
 
 # Initialize ADAMAH BEFORE torch/cupy to get priority on GPU memory
 import adamah
@@ -54,6 +63,43 @@ except Exception as e:
     print(f"[INIT] CuPy not available: {e}")
 
 # ============================================
+# Dtype registry
+# ============================================
+_FULL_OPS = {"op1", "op2", "broadcast", "reduce", "softmax", "layernorm", "matmul", "scatter", "gather"}
+_Q8_OPS = {"matmul", "scatter", "gather"}
+
+DTYPE_REGISTRY = {
+    "f32": {
+        "adamah_const": 0, "wordlength": 4, "label": "float32",
+        "q8_group_size": 128, "supported_ops": _FULL_OPS,
+        "torch_dtype": torch.float32 if torch else None,
+    },
+    "bf16": {
+        "adamah_const": 1, "wordlength": 2, "label": "bfloat16",
+        "q8_group_size": 128, "supported_ops": _FULL_OPS,
+        "torch_dtype": torch.bfloat16 if torch else None,
+    },
+    "q8": {
+        "adamah_const": 2, "wordlength": 1, "label": "int8 quantized",
+        "q8_group_size": 128, "supported_ops": _Q8_OPS,
+        "torch_dtype": torch.float32 if torch else None,
+    },
+}
+
+def typed_map_create(gpu, u, map_id, n_cells, dcfg):
+    """Create a map with proper dtype, register UUCIS metadata."""
+    adamah_dtype = dcfg["adamah_const"]
+    n_cells = int(n_cells)
+    if adamah_dtype == 0:
+        gpu.map_create(map_id, 4, 1, n_cells)
+    else:
+        gpu.map_create_typed(map_id, dtype=adamah_dtype, pack_size=1,
+                             n_packs=n_cells, group_size=dcfg["q8_group_size"])
+    wl = dcfg["wordlength"]
+    u._loc.set_map(map_id, dim=1, n_cells=n_cells, wordlength=wl,
+                   shape=(n_cells,), pack_size=1)
+
+# ============================================
 # Configuration
 # ============================================
 SEED = 42
@@ -83,8 +129,10 @@ def now_ms():
 #     normed = layernorm(combined)
 #     result = tanh(normed)
 
-def create_block1_adamah(gpu, u, seq, d, d_ff):
+def create_block1_adamah(gpu, u, seq, d, d_ff, dcfg=None):
     """Create attention-FFN hybrid block for ADAMAH"""
+    if dcfg is None:
+        dcfg = DTYPE_REGISTRY["f32"]
     rng = np.random.default_rng(SEED)
     
     # Allocate map regions
@@ -126,9 +174,9 @@ def create_block1_adamah(gpu, u, seq, d, d_ff):
         gpu.map_destroy(map_id)
     except:
         pass
-    gpu.map_create(map_id, 4, 1, total_floats)
+    typed_map_create(gpu, u, map_id, total_floats, dcfg)
     
-    # Initialize data
+    # Initialize data (always f32 on host -- ADAMAH converts on GPU)
     x_data = rng.standard_normal((seq, d)).astype(np.float32).flatten()
     wq_data = (rng.standard_normal((d, d)) * 0.02).astype(np.float32).flatten()
     wk_data = (rng.standard_normal((d, d)) * 0.02).astype(np.float32).flatten()
@@ -234,16 +282,18 @@ def create_block1_adamah(gpu, u, seq, d, d_ff):
     return run_block
 
 
-def create_block1_pytorch(seq, d, d_ff, device):
+def create_block1_pytorch(seq, d, d_ff, device, torch_dtype=None):
     """Create identical attention-FFN hybrid block for PyTorch"""
+    if torch_dtype is None:
+        torch_dtype = torch.float32
     rng = np.random.default_rng(SEED)
     
     # Create tensors (same initialization as ADAMAH)
-    X = torch.from_numpy(rng.standard_normal((seq, d)).astype(np.float32)).to(device)
-    Wq = torch.from_numpy((rng.standard_normal((d, d)) * 0.02).astype(np.float32)).to(device)
-    Wk = torch.from_numpy((rng.standard_normal((d, d)) * 0.02).astype(np.float32)).to(device)
-    W1 = torch.from_numpy((rng.standard_normal((d, d_ff)) * 0.02).astype(np.float32)).to(device)
-    W2 = torch.from_numpy((rng.standard_normal((d_ff, d)) * 0.02).astype(np.float32)).to(device)
+    X = torch.from_numpy(rng.standard_normal((seq, d)).astype(np.float32)).to(device=device, dtype=torch_dtype)
+    Wq = torch.from_numpy((rng.standard_normal((d, d)) * 0.02).astype(np.float32)).to(device=device, dtype=torch_dtype)
+    Wk = torch.from_numpy((rng.standard_normal((d, d)) * 0.02).astype(np.float32)).to(device=device, dtype=torch_dtype)
+    W1 = torch.from_numpy((rng.standard_normal((d, d_ff)) * 0.02).astype(np.float32)).to(device=device, dtype=torch_dtype)
+    W2 = torch.from_numpy((rng.standard_normal((d_ff, d)) * 0.02).astype(np.float32)).to(device=device, dtype=torch_dtype)
     gamma = torch.ones(d, device=device)
     beta = torch.zeros(d, device=device)
     
@@ -343,7 +393,9 @@ def create_block1_cupy(seq, d, d_ff):
 #   x3 = tanh(x2 + matmul(x2, W3))
 #   result = layernorm(x3)
 
-def create_block2_adamah(gpu, u, seq, d):
+def create_block2_adamah(gpu, u, seq, d, dcfg=None):
+    if dcfg is None:
+        dcfg = DTYPE_REGISTRY["f32"]
     """Create deep residual chain for ADAMAH"""
     rng = np.random.default_rng(SEED + 1)
     
@@ -370,7 +422,7 @@ def create_block2_adamah(gpu, u, seq, d):
         gpu.map_destroy(map_id)
     except:
         pass
-    gpu.map_create(map_id, 4, 1, total_floats)
+    typed_map_create(gpu, u, map_id, total_floats, dcfg)
     
     # Initialize
     x_data = rng.standard_normal((seq, d)).astype(np.float32).flatten()
@@ -449,16 +501,18 @@ def create_block2_adamah(gpu, u, seq, d):
     return run_block
 
 
-def create_block2_pytorch(seq, d, device):
+def create_block2_pytorch(seq, d, device, torch_dtype=None):
     """Create identical deep residual chain for PyTorch"""
+    if torch_dtype is None:
+        torch_dtype = torch.float32
     rng = np.random.default_rng(SEED + 1)
     
-    X = torch.from_numpy(rng.standard_normal((seq, d)).astype(np.float32)).to(device)
-    W1 = torch.from_numpy((rng.standard_normal((d, d)) * 0.02).astype(np.float32)).to(device)
-    W2 = torch.from_numpy((rng.standard_normal((d, d)) * 0.02).astype(np.float32)).to(device)
-    W3 = torch.from_numpy((rng.standard_normal((d, d)) * 0.02).astype(np.float32)).to(device)
-    gamma = torch.ones(d, device=device)
-    beta = torch.zeros(d, device=device)
+    X = torch.from_numpy(rng.standard_normal((seq, d)).astype(np.float32)).to(device=device, dtype=torch_dtype)
+    W1 = torch.from_numpy((rng.standard_normal((d, d)) * 0.02).astype(np.float32)).to(device=device, dtype=torch_dtype)
+    W2 = torch.from_numpy((rng.standard_normal((d, d)) * 0.02).astype(np.float32)).to(device=device, dtype=torch_dtype)
+    W3 = torch.from_numpy((rng.standard_normal((d, d)) * 0.02).astype(np.float32)).to(device=device, dtype=torch_dtype)
+    gamma = torch.ones(d, device=device, dtype=torch_dtype)
+    beta = torch.zeros(d, device=device, dtype=torch_dtype)
     
     def run_block():
         t1 = torch.mm(X, W1)
@@ -512,7 +566,9 @@ def create_block2_cupy(seq, d):
 # ============================================
 # Block 3: Multi-Head Attention (simplified)
 # ============================================
-def create_block3_adamah(gpu, u, seq, d, n_heads):
+def create_block3_adamah(gpu, u, seq, d, n_heads, dcfg=None):
+    if dcfg is None:
+        dcfg = DTYPE_REGISTRY["f32"]
     """Create multi-head attention for ADAMAH"""
     rng = np.random.default_rng(SEED + 2)
     head_dim = d // n_heads
@@ -540,7 +596,7 @@ def create_block3_adamah(gpu, u, seq, d, n_heads):
         gpu.map_destroy(map_id)
     except:
         pass
-    gpu.map_create(map_id, 4, 1, total_floats)
+    typed_map_create(gpu, u, map_id, total_floats, dcfg)
     
     # Initialize
     x_data = rng.standard_normal((seq, d)).astype(np.float32).flatten()
@@ -610,17 +666,19 @@ def create_block3_adamah(gpu, u, seq, d, n_heads):
     return run_block
 
 
-def create_block3_pytorch(seq, d, n_heads, device):
+def create_block3_pytorch(seq, d, n_heads, device, torch_dtype=None):
     """Create identical multi-head attention for PyTorch"""
+    if torch_dtype is None:
+        torch_dtype = torch.float32
     rng = np.random.default_rng(SEED + 2)
     head_dim = d // n_heads
     scale = 1.0 / np.sqrt(head_dim)
     
-    X = torch.from_numpy(rng.standard_normal((seq, d)).astype(np.float32)).to(device)
-    Wq = torch.from_numpy((rng.standard_normal((d, d)) * 0.02).astype(np.float32)).to(device)
-    Wk = torch.from_numpy((rng.standard_normal((d, d)) * 0.02).astype(np.float32)).to(device)
-    Wv = torch.from_numpy((rng.standard_normal((d, d)) * 0.02).astype(np.float32)).to(device)
-    Wo = torch.from_numpy((rng.standard_normal((d, d)) * 0.02).astype(np.float32)).to(device)
+    X = torch.from_numpy(rng.standard_normal((seq, d)).astype(np.float32)).to(device=device, dtype=torch_dtype)
+    Wq = torch.from_numpy((rng.standard_normal((d, d)) * 0.02).astype(np.float32)).to(device=device, dtype=torch_dtype)
+    Wk = torch.from_numpy((rng.standard_normal((d, d)) * 0.02).astype(np.float32)).to(device=device, dtype=torch_dtype)
+    Wv = torch.from_numpy((rng.standard_normal((d, d)) * 0.02).astype(np.float32)).to(device=device, dtype=torch_dtype)
+    Wo = torch.from_numpy((rng.standard_normal((d, d)) * 0.02).astype(np.float32)).to(device=device, dtype=torch_dtype)
     
     def run_block():
         Q = torch.mm(X, Wq)
@@ -670,10 +728,26 @@ def create_block3_cupy(seq, d, n_heads):
 # Main Benchmark
 # ============================================
 def main():
+    parser = argparse.ArgumentParser(description="ADAMAH mixed non-linear benchmark (multi-dtype)")
+    parser.add_argument("--dtype", choices=["f32", "bf16", "q8"], default="f32",
+                        help="Numeric format: f32 (default), bf16, or q8")
+    args = parser.parse_args()
+
+    dcfg = DTYPE_REGISTRY[args.dtype]
+    torch_dtype = dcfg["torch_dtype"]
+
+    # All blocks require full ops (matmul + softmax + layernorm + relu/tanh + add)
+    _required_ops = {"op1", "op2", "softmax", "layernorm", "matmul"}
+    if not _required_ops.issubset(dcfg["supported_ops"]):
+        print(f"[SKIP] Mixed non-linear benchmark requires full op set.")
+        print(f"       {args.dtype} only supports: {dcfg['supported_ops']}")
+        print(f"       Use --dtype f32 or --dtype bf16 for this benchmark.")
+        return
+
     global _adamah_gpu
     
     print("=" * 100)
-    print("ADAMAH Benchmark: Mixed Non-Linear Operations")
+    print(f"ADAMAH Benchmark: Mixed Non-Linear Operations -- dtype: {args.dtype} ({dcfg['label']})")
     print("=" * 100)
     print(f"Config: SEQ_LEN={SEQ_LEN}, D_MODEL={D_MODEL}, D_FF={D_FF}")
     print(f"PyTorch available: {_TORCH_AVAILABLE}")
@@ -683,6 +757,11 @@ def main():
     # Use already initialized ADAMAH instance
     gpu = _adamah_gpu
     u = gpu.uucis  # Use property accessor
+
+    # Set ADAMAH dtype (loads corresponding shader set)
+    if dcfg["adamah_const"] != 0:
+        gpu.set_dtype(dcfg["adamah_const"])
+        print(f"[ADAMAH] set_dtype -> {args.dtype} (shader set loaded)")
     
     results = []
     
@@ -693,11 +772,11 @@ def main():
     print("BLOCK 1: Attention-FFN Hybrid (parallel branches + merge)")
     print("=" * 100)
     
-    block1_adamah = create_block1_adamah(gpu, u, SEQ_LEN, D_MODEL, D_FF)
+    block1_adamah = create_block1_adamah(gpu, u, SEQ_LEN, D_MODEL, D_FF, dcfg=dcfg)
     
     if _TORCH_AVAILABLE:
         device = torch.device("cuda")
-        block1_torch = create_block1_pytorch(SEQ_LEN, D_MODEL, D_FF, device)
+        block1_torch = create_block1_pytorch(SEQ_LEN, D_MODEL, D_FF, device, torch_dtype=torch_dtype)
     
     if _CUPY_AVAILABLE:
         block1_cupy = create_block1_cupy(SEQ_LEN, D_MODEL, D_FF)
@@ -758,10 +837,10 @@ def main():
     print("BLOCK 2: Deep Residual Chain (sequential dependencies)")
     print("=" * 100)
     
-    block2_adamah = create_block2_adamah(gpu, u, SEQ_LEN, D_MODEL)
+    block2_adamah = create_block2_adamah(gpu, u, SEQ_LEN, D_MODEL, dcfg=dcfg)
     
     if _TORCH_AVAILABLE:
-        block2_torch = create_block2_pytorch(SEQ_LEN, D_MODEL, device)
+        block2_torch = create_block2_pytorch(SEQ_LEN, D_MODEL, device, torch_dtype=torch_dtype)
     
     if _CUPY_AVAILABLE:
         block2_cupy = create_block2_cupy(SEQ_LEN, D_MODEL)
@@ -823,10 +902,10 @@ def main():
     print("=" * 100)
     
     N_HEADS = 8
-    block3_adamah = create_block3_adamah(gpu, u, SEQ_LEN, D_MODEL, N_HEADS)
+    block3_adamah = create_block3_adamah(gpu, u, SEQ_LEN, D_MODEL, N_HEADS, dcfg=dcfg)
     
     if _TORCH_AVAILABLE:
-        block3_torch = create_block3_pytorch(SEQ_LEN, D_MODEL, N_HEADS, device)
+        block3_torch = create_block3_pytorch(SEQ_LEN, D_MODEL, N_HEADS, device, torch_dtype=torch_dtype)
     
     if _CUPY_AVAILABLE:
         block3_cupy = create_block3_cupy(SEQ_LEN, D_MODEL, N_HEADS)
