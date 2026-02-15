@@ -2374,7 +2374,13 @@ static int init_dtype_pipelines(uint32_t dtype) {
 int adamah_set_dtype(uint32_t dtype) {
     if (!ctx.initialized) return ADAMAH_ERR_INVALID;
     if (dtype >= DTYPE_COUNT) return ADAMAH_ERR_INVALID;
-    
+
+    // Ensure base pipelines are initialized (sets ctx.shader_path)
+    if (!ctx.shader_path[0]) {
+        int ret = init_pipelines();
+        if (ret != ADAMAH_OK) return ret;
+    }
+
     // Ensure f32 pipelines are loaded first (base requirement)
     if (!ctx.dtype_pipes_loaded[DTYPE_F32]) {
         init_dtype_pipelines(DTYPE_F32);

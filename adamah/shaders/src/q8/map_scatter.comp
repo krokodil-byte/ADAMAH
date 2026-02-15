@@ -1,0 +1,43 @@
+#version 450
+layout(local_size_x = 256) in;
+
+layout(push_constant) uniform PushConstants {
+    uint n_locs;
+    uint pack_size;
+    uint group_size;    // elements per quant group (32, 64, 128)
+} pc;
+
+// Map data stored as packed int8 quads in uint32
+layout(set = 0, binding = 0) buffer MapBuffer { uint map_data[]; };
+// Source data from CPU is always float32
+layout(set = 0, binding = 1) buffer SrcBuffer { float src_data[]; };
+layout(set = 0, binding = 2) buffer LocsBuffer { uint locs[]; };
+// Quantization params: interleaved [scale, zero_point] per group
+layout(set = 0, binding = 3) buffer QuantParams { float qparams[]; };
+
+void main() {
+    uint tid = gl_GlobalInvocationID.x;
+    uint total = pc.n_locs * pc.pack_size;
+    if (tid >= total) return;
+
+    uint loc_idx = tid / pc.pack_size;
+    uint elem_idx = tid % pc.pack_size;
+    uint dst_logical = locs[loc_idx] * pc.pack_size + elem_idx;
+
+    // Find quantization group
+    uint group_idx = dst_logical / pc.group_size;
+    float scale = qparams[group_idx * 2u];
+    float zero_point = qparams[group_idx * 2u + 1u];
+
+    float val = src_data[tid];
+    float inv_scale = (scale != 0.0) ? (1.0 / scale) : 0.0;
+    int ival = int(round(val * inv_scale + zero_point));
+    ival = clamp(ival, -128, 127);
+    uint byte_val = uint(ival) & 0xFFu;
+
+    uint word_idx = dst_logical >> 2u;
+    uint sub_idx = dst_logical & 3u;
+    uint shift = sub_idx * 8u;
+    atomicAnd(map_data[word_idx], ~(0xFFu << shift));
+    atomicOr(map_data[word_idx], byte_val << shift);
+}
