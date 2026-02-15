@@ -1,0 +1,61 @@
+#version 450
+layout(local_size_x = 16, local_size_y = 16, local_size_z = 1) in;
+
+layout(push_constant) uniform PushConstants {
+    uint M;
+    uint K;
+    uint N;
+    uint n_ops;
+    uint group_size;   // quant group size for weights
+} pc;
+
+// Weights stored as packed int8 in uint32
+layout(set = 0, binding = 0) buffer MapBuffer { uint data[]; };
+layout(set = 0, binding = 1) buffer LocsA { uint locs_a[]; };
+layout(set = 0, binding = 2) buffer LocsB { uint locs_b[]; };
+layout(set = 0, binding = 3) buffer LocsC { uint locs_c[]; };
+// Quant params for weight matrix B: [scale, zp] per group
+layout(set = 0, binding = 4) buffer QuantParams { float qparams[]; };
+
+// Dequantize one int8 element from packed uint32 buffer
+float dequant_q8(uint base_idx, uint offset) {
+    uint logical = base_idx + offset;
+    uint word_idx = logical >> 2u;
+    uint sub_idx = logical & 3u;
+    uint byte_val = (data[word_idx] >> (sub_idx * 8u)) & 0xFFu;
+    int ival = int(byte_val);
+    if ((byte_val & 0x80u) != 0u) ival -= 256;
+
+    uint group_idx = logical / pc.group_size;
+    float scale = qparams[group_idx * 2u];
+    float zero_point = qparams[group_idx * 2u + 1u];
+    return (float(ival) - zero_point) * scale;
+}
+
+// Load float32 from the same buffer (for activations stored as f32)
+float load_f32(uint idx) {
+    return uintBitsToFloat(data[idx]);
+}
+
+void main() {
+    uint row = gl_GlobalInvocationID.x;
+    uint col = gl_GlobalInvocationID.y;
+    uint op_idx = gl_GlobalInvocationID.z;
+
+    if (row >= pc.M || col >= pc.N || op_idx >= pc.n_ops) return;
+
+    uint a_base = locs_a[op_idx];   // activations (f32)
+    uint b_base = locs_b[op_idx];   // weights (q8)
+    uint c_base = locs_c[op_idx];   // output (f32)
+
+    // Accumulate in float32
+    float sum = 0.0;
+    for (uint k = 0u; k < pc.K; k++) {
+        float a_val = load_f32(a_base + row * pc.K + k);
+        float b_val = dequant_q8(b_base, k * pc.N + col);
+        sum += a_val * b_val;
+    }
+
+    // Store output as float32
+    data[c_base + row * pc.N + col] = floatBitsToUint(sum);
+}

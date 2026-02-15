@@ -1,0 +1,35 @@
+[build-system]
+requires = ["setuptools>=68", "wheel"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "adamah"
+version = "5.1.0"
+description = "High-performance cross-platform GPU compute framework - beats PyTorch by 4.5x"
+readme = "README.md"
+requires-python = ">=3.8"
+license = {text = "MIT"}
+authors = [{name = "Samuele Scuglia"}]
+keywords = ["gpu", "vulkan", "compute", "ai", "ml", "transformer", "cuda-alternative"]
+classifiers = [
+  "Development Status :: 4 - Beta",
+  "Intended Audience :: Developers",
+  "Intended Audience :: Science/Research",
+  "Topic :: Scientific/Engineering :: Artificial Intelligence",
+  "Programming Language :: Python :: 3",
+  "Programming Language :: C",
+  "Operating System :: POSIX :: Linux",
+]
+dependencies = ["numpy"]
+
+[project.urls]
+Homepage = "https://github.com/krokodil-byte/ADAMAH"
+
+[tool.setuptools]
+include-package-data = true
+
+[tool.setuptools.packages.find]
+where = ["."]
+
+[tool.setuptools.package-data]
+"adamah" = ["*.so", "*.c", "shaders/*.spv"]
